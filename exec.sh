@@ -1,0 +1,1 @@
+docker exec -it mobile_robotics_project bash

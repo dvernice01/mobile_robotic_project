@@ -1,0 +1,23 @@
+# ROS2 colcon
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Bag files
+*.bag
+*.db3
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# System
+.DS_Store
