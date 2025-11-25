@@ -55,6 +55,8 @@ Communications Failed
 APF_CONFIG = {
     'repulsive_gain': 2.0,      # Guadagno forza repulsiva
     'attractive_gain': 1.0,     # Guadagno forza attrattiva  
+    'LIN_VELOCITY_GAIN': 3.0,
+    'ANG_VELOCITY_GAIN': 3.0,
 }
 
 # get_key serve a prendere il singolo tasto premuto.
@@ -149,8 +151,10 @@ class ArtificialPotentialField:
     
     def compute_attractive_forces(self, v_lin, x_dist, y_dist):
         
-        attractive_force = self.config['attractive_gain'] * (v_lin * np.sin (np.arctan2(y_dist, x_dist)))
-
+        #attractive_force = self.config['attractive_gain'] * (v_lin * np.sin (np.arctan2(y_dist, x_dist)))
+        attractive_force_x = self.config['attractive_gain'] * v_lin
+        attractive_force_y = attractive_force_x * (y_dist / x_dist) # angolo verde = atan di (y/x) e si semplifica con tan
+        attractive_force = [attractive_force_x , attractive_force_y]
         return attractive_force
     
     def compute_repulsive_forces(self, x_dist, y_dist):
@@ -159,17 +163,31 @@ class ArtificialPotentialField:
         eta_0 = 1
         eta_i = x_dist * np.sin (np.arctan2(y_dist, x_dist))
         eta_i = max(abs(eta_i), 0.1)
-        repulsive_force = (self.config['repulsive_gain']/eta_i**2) * ((1/eta_i - 1/eta_0)**(gamma - 1))
-
+        APF_computation = (self.config['repulsive_gain']/eta_i**2) * ((1/eta_i - 1/eta_0)**(gamma - 1))
+        repulsive_force_y = APF_computation / np.cos (np.atan2 (y_dist, x_dist))
+        repulsive_force_x = repulsive_force_y * np.sin (np.atan2 (y_dist, x_dist))
+        repulsive_force = [repulsive_force_x , repulsive_force_y]
         return repulsive_force
 
-    def compute_total_forces (self, control_linear_velocity, distance):
+    def compute_proportional_velocities(self, control_linear_velocity, distance):
         
         attractive_force = self.compute_attractive_forces (control_linear_velocity,distance[0], distance[1])
         repulsive_force = self.compute_repulsive_forces(distance[0], distance[1])
-        total_forces = [attractive_force, repulsive_force]
-
-        return total_forces
+        total_forces = [attractive_force[0] - repulsive_force[0] , attractive_force[1] - repulsive_force[1]]
+        
+        if attractive_force[0] != 0:
+            prop_lin_vel = total_forces[0] / attractive_force[0]
+        else:
+            prop_lin_vel = 0
+        
+        if attractive_force[1] !=0:
+            prop_ang_vel = total_forces[1] / attractive_force[1]
+        else:
+            prop_ang_vel = 0
+            
+        prop_velocities = [prop_lin_vel , prop_ang_vel]
+         
+        return prop_velocities
 
 
 class APFController:
@@ -198,17 +216,25 @@ class APFController:
         y_offset = 4    # Il secondo è Y (4 bytes dopo)  
         z_offset = 8    # Il terzo è Z (8 bytes dopo) - QUESTA È LA PROFONDITÀ!
         
-        # 2. SCORRI TUTTI I PUNTI
-        for i in range(0, len(msg.data), msg.point_step):
+         # 2. SCORRI TUTTI I PUNTI
+        for i in range(0, len(msg.data), 30 * msg.point_step):
             point_data = msg.data[i:i + msg.point_step]
+            #print('point_data:', point_data)
             
             # 3. ESTRAI COORDINATE 3D
             x = struct.unpack('f', point_data[x_offset:x_offset+4])[0] 
             y = struct.unpack('f', point_data[y_offset:y_offset+4])[0]  
             z = struct.unpack('f', point_data[z_offset:z_offset+4])[0] 
             
-            if 0.3 < math.sqrt(x**2 + y**2) <= 1.0 and z != 680.68:   
+            #if not np.isnan(x) and not np.isinf(x) and \
+               #not np.isnan(y) and not np.isinf(y) and \
+               #not np.isnan(z) and not np.isinf(z):  # Solo primi 5 punti per non intasare
+            #if not np.isinf(x):
+            #    print(f"Punto {i//msg.point_step}: x={x:.3f}, y={y:.3f}, z={z:.3f}")
+            
+            if 0.3 < math.sqrt(x**2 + y**2) <= 1.0 and z >= 0.4:   
                 obstacles.append([x, y, z])
+       
         
         return obstacles
 
@@ -259,17 +285,20 @@ def main():
             rclpy.spin_once(node, timeout_sec=0.01)
            
             if len(apf_controller.apf.obstacles) > 0:
+                print("APF attivo, numero ostacoli:", len(apf_controller.apf.obstacles))
+
                 # Modalità APF
                 for obstacle in apf_controller.apf.obstacles:
                     x, y, z = obstacle
                     distance = [x, y, z]
 
-                    forces = apf_controller.apf.compute_total_forces(
+                    velocities = apf_controller.apf.compute_proportional_velocities(
                         control_linear_velocity, 
                         distance
                     )
-                    final_lin_vel = control_linear_velocity + forces[0]
-                    final_ang_vel = control_angular_velocity + forces[1]
+                    
+                    final_lin_vel = control_linear_velocity - (np.sign (control_linear_velocity) * velocities[0] * APF_CONFIG['LIN_VELOCITY_GAIN']) 
+                    final_ang_vel = control_angular_velocity - (np.sign (control_linear_velocity) * velocities[1] * APF_CONFIG['ANG_VELOCITY_GAIN'])
 
                 update_velocity(pub,ROS_DISTRO, final_lin_vel, final_ang_vel)
 
@@ -314,7 +343,7 @@ def main():
                     control_linear_velocity,
                     target_linear_velocity,
                     (LIN_VEL_STEP_SIZE / 2.0))
-
+  
                 control_angular_velocity = make_simple_profile(
                     control_angular_velocity,
                     target_angular_velocity,
