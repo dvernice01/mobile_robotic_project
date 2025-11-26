@@ -254,7 +254,12 @@ class ArtificialPotentialField:
         eta_i = x_dist * np.sin (np.arctan2(y_dist, x_dist))
         eta_i = max(abs(eta_i), 0.1)
         APF_computation = (self.config['repulsive_gain']/eta_i**2) * ((1/eta_i - 1/eta_0)**(gamma - 1))
+        
+        #if abs(np.atan2 (y_dist, x_dist)) <= 0.1:
+         #   repulsive_force_y = 0
+        #else:
         repulsive_force_y = APF_computation / np.cos (np.atan2 (y_dist, x_dist))
+            
         repulsive_force_x = repulsive_force_y * np.sin (np.atan2 (y_dist, x_dist))
         repulsive_force = [repulsive_force_x , repulsive_force_y]
         return repulsive_force
@@ -335,6 +340,10 @@ class APFController:
                 
         claustered_objects = self.obstacle_detector.cluster_obstacles(objects_detected)
         for obstacle in claustered_objects:
+            """cx, cy, cz = obstacle['centroid']
+            # filtro il pavimento
+            if cz < 0.5:
+                continue"""
             obstacles.append(obstacle['centroid'])
         
         return obstacles
@@ -406,7 +415,11 @@ def main():
                     if abs(velocities[1]) > MAX_VEL:
                         velocities[1] = np.sign(velocities[1]) * MAX_VEL
                     
-                    final_lin_vel = control_linear_velocity - (np.sign (control_linear_velocity) * velocities[0] * APF_CONFIG['LIN_VELOCITY_GAIN']) 
+                    final_lin_vel = control_linear_velocity - (np.sign (control_linear_velocity) * velocities[0] * APF_CONFIG['LIN_VELOCITY_GAIN'])
+                    
+                    #if velocities[1] == 1:
+                    #    final_ang_vel = 0
+                    #else: 
                     final_ang_vel = control_angular_velocity - (np.sign (control_linear_velocity) * velocities[1] * APF_CONFIG['ANG_VELOCITY_GAIN'])
 
                 update_velocity(pub,ROS_DISTRO, final_lin_vel, final_ang_vel)
