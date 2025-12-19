@@ -17,6 +17,7 @@ from rclpy.qos import QoSProfile
 from pyclustering.cluster.dbscan import dbscan
 from pyclustering.utils import timedcall
 
+
 if os.name == 'nt':
     import msvcrt
 else:
@@ -57,9 +58,9 @@ Communications Failed
 # vettore dei guadagni 
 APF_CONFIG = {
     'repulsive_gain': 0.5,      # Guadagno forza repulsiva
-    'attractive_gain': 5.0,     # Guadagno forza attrattiva  
+    'attractive_gain': 2.0,     # Guadagno forza attrattiva  
     'LIN_VELOCITY_GAIN': 1.0,
-    'ANG_VELOCITY_GAIN': 0.01,
+    'ANG_VELOCITY_GAIN': 0.2,
 }
 
 # get_key serve a prendere il singolo tasto premuto.
@@ -147,7 +148,7 @@ def update_velocity(pub,ROS_DISTRO,lin_velocity, ang_velocity):
         
         
 class ObstacleDetector:
-    def __init__(self, eps=0.5, min_points=10):
+    def __init__(self, eps=0.5, min_points=3):
         """
         DBSCAN parameters:
         - eps: distance threshold for neighborhood (in meters)
@@ -239,52 +240,34 @@ class ArtificialPotentialField:
         self.config = config
         self.obstacles = []  
     
-    def compute_attractive_forces(self, v_lin, x_dist, y_dist):
+    def compute_attractive_forces(self, v_lin, angle):
         
         #attractive_force = self.config['attractive_gain'] * (v_lin * np.sin (np.arctan2(y_dist, x_dist)))
-        attractive_force_x = self.config['attractive_gain'] * v_lin
-        attractive_force_y = attractive_force_x * (y_dist / x_dist) # angolo verde = atan di (y/x) e si semplifica con tan
-        attractive_force = [attractive_force_x , attractive_force_y]
-        return attractive_force
+        new_lin_vel = v_lin * np.cos (angle)
+        attractive_force = v_lin * np.sin(angle) * self.config['attractive_gain'] # angolo verde = atan di (y/x) e si semplifica con tan
+        
+        return [ new_lin_vel, attractive_force ]
     
-    def compute_repulsive_forces(self, x_dist, y_dist):
+    def compute_repulsive_forces(self, x_dist, angle):
 
         gamma = 1
         eta_0 = 3
-        eta_i = x_dist * np.sin (np.arctan2(y_dist, x_dist))
+        eta_i = x_dist * np.sin (angle)
+        print(eta_i)
         eta_i = max(abs(eta_i), 0.1)
-        APF_computation = (self.config['repulsive_gain']/eta_i**2) * ((1/eta_i - 1/eta_0)**(gamma - 1))
+        repulsive_force = (self.config['repulsive_gain']/eta_i**2) * ((1/eta_i - 1/eta_0)**(gamma - 1))
         
-        #if abs(np.atan2 (y_dist, x_dist)) <= 0.1:
-         #   repulsive_force_y = 0
-        #else:
-        repulsive_force_y = APF_computation / np.cos (np.atan2 (y_dist, x_dist))
-            
-        repulsive_force_x = repulsive_force_y * np.sin (np.atan2 (y_dist, x_dist))
-        repulsive_force = [repulsive_force_x , repulsive_force_y]
         return repulsive_force
 
-    def compute_proportional_velocities(self, control_linear_velocity, distance):
+    def compute_total_force(self, control_linear_velocity, distance):
         
-        attractive_force = self.compute_attractive_forces (control_linear_velocity,distance[0], distance[1])
-        repulsive_force = self.compute_repulsive_forces(distance[0], distance[1])
-        total_forces = [attractive_force[0] - repulsive_force[0] , attractive_force[1] - repulsive_force[1]]
+        angle = np.atan2 (distance[1], distance[0])
         
-        if attractive_force[0] != 0:
-            prop_lin_vel = total_forces[0] / attractive_force[0]
-        else:
-            prop_lin_vel = 0
-        
-        
-        if attractive_force[1] !=0:
-            prop_ang_vel = total_forces[1] / attractive_force[1]
-        else:
-            prop_ang_vel = 0
+        [ new_lin_vel, attractive_force ] = self.compute_attractive_forces (control_linear_velocity, angle)
+        repulsive_force = self.compute_repulsive_forces(distance[0], angle )
+        total_force = attractive_force - repulsive_force
          
-            
-        prop_velocities = [prop_lin_vel , prop_ang_vel]
-         
-        return prop_velocities
+        return [ new_lin_vel, total_force ]
 
 
 class APFController:
@@ -296,6 +279,7 @@ class APFController:
         self.control_angular_velocity = control_angular_velocity
         self.apf = ArtificialPotentialField(APF_CONFIG)
         self.obstacle_detector = obstacle_detector_instance
+        #self.obstacle_centroids = []
 
     def point_cloud_callback(self, msg):
         try:
@@ -325,18 +309,21 @@ class APFController:
             y = struct.unpack('f', point_data[y_offset:y_offset+4])[0]  
             z = struct.unpack('f', point_data[z_offset:z_offset+4])[0] 
             
+            x, y = y, x
+            
             #if not np.isnan(x) and not np.isinf(x) and \
                #not np.isnan(y) and not np.isinf(y) and \
                #not np.isnan(z) and not np.isinf(z):  # Solo primi 5 punti per non intasare
             #if not np.isinf(x):
                 #print(f"Punto {i//msg.point_step}: x={x:.3f}, y={y:.3f}, z={z:.3f}")
             
-            if (0.3 < x <= 5.0 and      # Distanza: 0.3-5.0 metri
+            if (0.3 < x <= 3.0 and      # Distanza: 0.3-5.0 metri
                 abs(y) < 3.0 and        # Laterale: ±3.0 metri
                 -0.5 < z < 2.5 and      # Altezza: sopra pavimento, sotto 2.5m
                 x != 680.68):           # Filtra valori corrotti
             
                 objects_detected.append([x, y, z])
+                #self.pointcloud_points.append([x, y, z])
                 
         claustered_objects = self.obstacle_detector.cluster_obstacles(objects_detected)
         for obstacle in claustered_objects:
@@ -345,6 +332,7 @@ class APFController:
             if cz < 0.5:
                 continue"""
             obstacles.append(obstacle['centroid'])
+            #self.obstacle_centroids.append(obstacle['centroid'])
         
         return obstacles
 
@@ -402,26 +390,30 @@ def main():
                     x, y, z = obstacle
                     distance = [x, y, z]
 
-                    velocities = apf_controller.apf.compute_proportional_velocities(
+                    [ velocity, force ] = apf_controller.apf.compute_total_force(
                         control_linear_velocity, 
                         distance
                     )
-                    print('velocities:', velocities[0], velocities[1])
+                    """print('velocities:', velocities[0], velocities[1])
                     MAX_VEL = 2.0
                     
                     if abs(velocities[0]) > MAX_VEL:
                         velocities[0] = np.sign(velocities[0]) * MAX_VEL
                        
                     if abs(velocities[1]) > MAX_VEL:
-                        velocities[1] = np.sign(velocities[1]) * MAX_VEL
+                        velocities[1] = np.sign(velocities[1]) * MAX_VEL"""
                     
-                    final_lin_vel = control_linear_velocity - (np.sign (control_linear_velocity) * velocities[0] * APF_CONFIG['LIN_VELOCITY_GAIN'])
-                    
+                    #final_lin_vel = control_linear_velocity - (np.sign (control_linear_velocity) * velocities[0] * APF_CONFIG['LIN_VELOCITY_GAIN'])
+                    final_lin_vel = velocity * APF_CONFIG['LIN_VELOCITY_GAIN']
                     #if velocities[1] == 1:
                     #    final_ang_vel = 0
                     #else: 
-                    final_ang_vel = control_angular_velocity - (np.sign (control_linear_velocity) * velocities[1] * APF_CONFIG['ANG_VELOCITY_GAIN'])
-
+                    
+                    sign = np.sign(control_angular_velocity)
+                    final_ang_vel = control_angular_velocity - (sign*abs(force))
+                    #final_ang_vel = control_angular_velocity - (np.sign (control_linear_velocity) * velocities[1] * APF_CONFIG['ANG_VELOCITY_GAIN'])
+                    #final_ang_vel = - velocities[1] * APF_CONFIG['ANG_VELOCITY_GAIN']
+                    
                 update_velocity(pub,ROS_DISTRO, final_lin_vel, final_ang_vel)
 
             else:
@@ -500,6 +492,7 @@ def main():
             twist_stamped.twist.angular.y = 0.0
             twist_stamped.twist.angular.z = control_angular_velocity
             pub.publish(twist_stamped)
+            
 
         if os.name != 'nt':
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings)
