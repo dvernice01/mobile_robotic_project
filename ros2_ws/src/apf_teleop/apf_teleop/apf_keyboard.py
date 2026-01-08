@@ -1,3 +1,4 @@
+#debug
 import os
 import select
 import sys
@@ -57,7 +58,7 @@ Communications Failed
 
 # vettore dei guadagni 
 APF_CONFIG = {
-    'repulsive_gain': 0.5,      # Guadagno forza repulsiva
+    'repulsive_gain': 2.0,      # Guadagno forza repulsiva
     'attractive_gain': 2.0,     # Guadagno forza attrattiva  
     'LIN_VELOCITY_GAIN': 1.0,
     'ANG_VELOCITY_GAIN': 0.2,
@@ -252,7 +253,7 @@ class ArtificialPotentialField:
 
         gamma = 1
         eta_0 = 3
-        eta_i = x_dist * np.sin (angle)
+        eta_i = x_dist * np.sin(angle)
         print(eta_i)
         eta_i = max(abs(eta_i), 0.1)
         repulsive_force = (self.config['repulsive_gain']/eta_i**2) * ((1/eta_i - 1/eta_0)**(gamma - 1))
@@ -261,13 +262,13 @@ class ArtificialPotentialField:
 
     def compute_total_force(self, control_linear_velocity, distance):
         
-        angle = np.atan2 (distance[1], distance[0])
-        
+        angle = np.atan2 (distance[1] , distance[0])
+        print(f"[OSTACOLO] x={distance[0]:.2f}, y={distance[1]:.2f}, angle={np.degrees(angle):.1f}°")
         [ new_lin_vel, attractive_force ] = self.compute_attractive_forces (control_linear_velocity, angle)
         repulsive_force = self.compute_repulsive_forces(distance[0], angle )
         total_force = attractive_force - repulsive_force
          
-        return [ new_lin_vel, total_force ]
+        return [ new_lin_vel, total_force, angle ]
 
 
 class APFController:
@@ -279,7 +280,7 @@ class APFController:
         self.control_angular_velocity = control_angular_velocity
         self.apf = ArtificialPotentialField(APF_CONFIG)
         self.obstacle_detector = obstacle_detector_instance
-        #self.obstacle_centroids = []
+        #self.obstacle_centroids = [] -0.05 -0.04 0.02
 
     def point_cloud_callback(self, msg):
         try:
@@ -309,7 +310,7 @@ class APFController:
             y = struct.unpack('f', point_data[y_offset:y_offset+4])[0]  
             z = struct.unpack('f', point_data[z_offset:z_offset+4])[0] 
             
-            x, y = y, x
+            x, y = -y, x
             
             #if not np.isnan(x) and not np.isinf(x) and \
                #not np.isnan(y) and not np.isinf(y) and \
@@ -390,7 +391,7 @@ def main():
                     x, y, z = obstacle
                     distance = [x, y, z]
 
-                    [ velocity, force ] = apf_controller.apf.compute_total_force(
+                    [ velocity, force, angle ] = apf_controller.apf.compute_total_force(
                         control_linear_velocity, 
                         distance
                     )
@@ -408,13 +409,18 @@ def main():
                     #if velocities[1] == 1:
                     #    final_ang_vel = 0
                     #else: 
-                    
-                    sign = np.sign(control_angular_velocity)
-                    final_ang_vel = control_angular_velocity - (sign*abs(force))
+                    if force < 0:
+                        sign = np.sign(distance[1])
+                        final_ang_vel = -(sign*abs(force))
+                    else:
+                        final_ang_vel = control_angular_velocity
+                        
+                    final_ang_vel = check_angular_limit_velocity (final_ang_vel)
                     #final_ang_vel = control_angular_velocity - (np.sign (control_linear_velocity) * velocities[1] * APF_CONFIG['ANG_VELOCITY_GAIN'])
                     #final_ang_vel = - velocities[1] * APF_CONFIG['ANG_VELOCITY_GAIN']
                     
                 update_velocity(pub,ROS_DISTRO, final_lin_vel, final_ang_vel)
+                print('velocities: ', final_lin_vel, final_ang_vel)
 
             else:
 
