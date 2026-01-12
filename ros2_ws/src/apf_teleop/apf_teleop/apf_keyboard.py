@@ -10,6 +10,8 @@ import numpy as np
 
 from geometry_msgs.msg import Twist
 from geometry_msgs.msg import TwistStamped
+from geometry_msgs.msg import PointStamped
+
 from sensor_msgs.msg import PointCloud2
 import rclpy
 from rclpy.clock import Clock
@@ -17,6 +19,7 @@ from rclpy.qos import QoSProfile
 
 from pyclustering.cluster.dbscan import dbscan
 from pyclustering.utils import timedcall
+from tf2_ros import Buffer, TransformListener
 
 
 if os.name == 'nt':
@@ -255,7 +258,7 @@ class ArtificialPotentialField:
         eta_0 = 3
         eta_i = x_dist * np.sin(angle)
         print(eta_i)
-        eta_i = max(abs(eta_i), 0.1)
+        eta_i = np.sign(eta_i) * max(abs(eta_i), 0.1)
         repulsive_force = (self.config['repulsive_gain']/eta_i**2) * ((1/eta_i - 1/eta_0)**(gamma - 1))
         
         return repulsive_force
@@ -263,7 +266,7 @@ class ArtificialPotentialField:
     def compute_total_force(self, control_linear_velocity, distance):
         
         angle = np.atan2 (distance[1] , distance[0])
-        print(f"[OSTACOLO] x={distance[0]:.2f}, y={distance[1]:.2f}, angle={np.degrees(angle):.1f}°")
+        print(f"[OSTACOLO] x={distance[0]:.2f}, y={distance[1]:.2f}, z={distance[2]:.2f}, angle={np.degrees(angle):.1f}°")
         [ new_lin_vel, attractive_force ] = self.compute_attractive_forces (control_linear_velocity, angle)
         repulsive_force = self.compute_repulsive_forces(distance[0], angle )
         total_force = attractive_force - repulsive_force
@@ -280,7 +283,11 @@ class APFController:
         self.control_angular_velocity = control_angular_velocity
         self.apf = ArtificialPotentialField(APF_CONFIG)
         self.obstacle_detector = obstacle_detector_instance
-        #self.obstacle_centroids = [] -0.05 -0.04 0.02
+        
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, node)
+
+        #self.obstacle_centroids = [] -0.05 -0.04 0.02    x=2.83, y=1.17, z=0.32
 
     def point_cloud_callback(self, msg):
         try:
@@ -310,9 +317,34 @@ class APFController:
             y = struct.unpack('f', point_data[y_offset:y_offset+4])[0]  
             z = struct.unpack('f', point_data[z_offset:z_offset+4])[0] 
             
-            x, y = -y, x
+            p = PointStamped()
+            p.header.frame_id = msg.header.frame_id  # es: zed_left_camera_frame
+            p.header.stamp = msg.header.stamp
+            p.point.x = x
+            p.point.y = y
+            p.point.z = z
+
+            # Trasforma nel frame del robot
+            try:
+                transform = self.tf_buffer.lookup_transform(
+                    'chassis_link',
+                    p.header.frame_id,
+                    p.header.stamp
+                )
+                
+                p_chassis = tf2_geometry_msgs.do_transform_point(p, transform)
+
+                x = p_chassis.point.x
+                y = p_chassis.point.y
+                z = p_chassis.point.z
+
+            except Exception as e:
+                self.node.get_logger().warn("TF non disponibile")
+                continue
+
+            #x, y = -y, x
             
-            #if not np.isnan(x) and not np.isinf(x) and \
+            #if not np.isnan(x) and not np.isinf(x) and \ -0.05 -0.04 0.02
                #not np.isnan(y) and not np.isinf(y) and \
                #not np.isnan(z) and not np.isinf(z):  # Solo primi 5 punti per non intasare
             #if not np.isinf(x):
@@ -322,7 +354,8 @@ class APFController:
                 abs(y) < 3.0 and        # Laterale: ±3.0 metri
                 -0.5 < z < 2.5 and      # Altezza: sopra pavimento, sotto 2.5m
                 x != 680.68):           # Filtra valori corrotti
-            
+
+                print(f"RAW: x={x:.2f}, y={y:.2f}, z={z:.2f}")
                 objects_detected.append([x, y, z])
                 #self.pointcloud_points.append([x, y, z])
                 
