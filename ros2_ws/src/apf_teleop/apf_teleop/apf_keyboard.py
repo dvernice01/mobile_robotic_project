@@ -16,6 +16,8 @@ from sensor_msgs.msg import PointCloud2
 import rclpy
 from rclpy.clock import Clock
 from rclpy.qos import QoSProfile
+from rclpy.time import Time
+from rclpy.duration import Duration
 
 from pyclustering.cluster.dbscan import dbscan
 from pyclustering.utils import timedcall
@@ -300,83 +302,80 @@ class APFController:
             self.node.get_logger().error(f"Errore pointcloud: {e}")
 
     def get_obstacle_positions(self, msg):
-        
         obstacles = []
         objects_detected = []
         
-        # 1. PRENDI I PRIMI 3 CAMPI (di solito sono x,y,z)
-        x_offset = 0    # Il primo campo è quasi sempre X
-        y_offset = 4    # Il secondo è Y (4 bytes dopo)  
-        z_offset = 8    # Il terzo è Z (8 bytes dopo) - QUESTA È LA PROFONDITÀ!
+        x_offset = 0
+        y_offset = 4
+        z_offset = 8
         
-        def get_obstacle_positions(self, msg):
-            obstacles = []
-            objects_detected = []
-            
-            x_offset = 0
-            y_offset = 4
-            z_offset = 8
-            
-            # Verifica che il TF sia disponibile PRIMA di processare i punti
-            try:
-                # Cerca la trasformazione con timeout più lungo
-                transform = self.tf_buffer.lookup_transform(
-                    'chassis_link',  # target frame
-                    msg.header.frame_id,  # source frame (zed_left_camera_frame)
-                    rclpy.time.Time(),
-                    # Time.from_msg(msg.header.stamp),
-                    timeout=rclpy.duration.Duration(seconds=1.0)  # Timeout 1 secondo
-                )
-                self.node.get_logger().info(f"TF trovato: {msg.header.frame_id} -> chassis_link")
-                
-            except Exception as e:
-                self.node.get_logger().warn(f"TF non disponibile: {e}")
-                return []  # Ritorna lista vuota se non c'è TF
-            
-            # Ora processa i punti
-            for i in range(0, len(msg.data), msg.point_step):
-                point_data = msg.data[i:i + msg.point_step]
-                
-                x = struct.unpack('f', point_data[x_offset:x_offset+4])[0] 
-                y = struct.unpack('f', point_data[y_offset:y_offset+4])[0]  
-                z = struct.unpack('f', point_data[z_offset:z_offset+4])[0]
-                
-                # Crea il punto nel frame della camera
-                p = PointStamped()
-                p.header.frame_id = msg.header.frame_id
-                p.header.stamp = msg.header.stamp
-                p.point.x = x
-                p.point.y = y
-                p.point.z = z
+        now = self.node.get_clock().now()
+        msg_time = Time.from_msg(msg.header.stamp)
 
-                # Trasforma nel frame del robot (usa il transform già ottenuto)
-                try:
-                    p_chassis = tf2_geometry_msgs.do_transform_point(p, transform)
-                    
-                    x_robot = p_chassis.point.x
-                    y_robot = p_chassis.point.y
-                    z_robot = p_chassis.point.z
-                    print(f"Robot frame:  x={x_robot:.2f}, y={y_robot:.2f}, z={z_robot:.2f}")
-                    
-                    # Filtra punti validi
-                    if (0.3 < x_robot <= 3.0 and
-                        abs(y_robot) < 3.0 and
-                        -0.5 < z_robot < 2.5):
-                        
-                        print(f"Trasformato: camera[{x:.2f},{y:.2f},{z:.2f}] -> chassis[{x_robot:.2f},{y_robot:.2f},{z_robot:.2f}]")
-                        objects_detected.append([x_robot, y_robot, z_robot])
-                        
-                except Exception as e:
-                    self.node.get_logger().error(f"Errore trasformazione punto: {e}")
-                    continue
+        # 🔴 SCARTA POINTCLOUD VECCHIE (>0.5s)
+        if (now - msg_time).nanoseconds > 5e8:
+            self.node.get_logger().warn("PointCloud troppo vecchia, scarto")
+            return []
+        
+        # Verifica che il TF sia disponibile PRIMA di processare i punti
+        try:
+            # Cerca la trasformazione con timeout più lungo
+            transform = self.tf_buffer.lookup_transform(
+                'zed_camera_link',  # target frame
+                msg.header.frame_id,              # source
+                msg_time,                         
+                timeout=Duration(seconds=0.5)
+            )
+            self.node.get_logger().info(f"TF trovato: {msg.header.frame_id} -> chassis_link")
             
-            # Clusterizza gli ostacoli
-            claustered_objects = self.obstacle_detector.cluster_obstacles(objects_detected)
-            for obstacle in claustered_objects:
-                obstacles.append(obstacle['centroid'])
+        except Exception as e:
+            self.node.get_logger().warn(f"TF non disponibile: {e}")
+            return []  # Ritorna lista vuota se non c'è TF
+        
+        # Ora processa i punti
+        for i in range(0, len(msg.data), msg.point_step):
+            point_data = msg.data[i:i + msg.point_step]
             
-            return obstacles
+            x = struct.unpack('f', point_data[x_offset:x_offset+4])[0] 
+            y = struct.unpack('f', point_data[y_offset:y_offset+4])[0]  
+            z = struct.unpack('f', point_data[z_offset:z_offset+4])[0]
+            
+            # Crea il punto nel frame della camera
+            p = PointStamped()
+            p.header.frame_id = msg.header.frame_id
+            p.header.stamp = msg.header.stamp
+            p.point.x = x
+            p.point.y = y
+            p.point.z = z
+
+            # Trasforma nel frame del robot (usa il transform già ottenuto)
+            try:
+                p_chassis = tf2_geometry_msgs.do_transform_point(p, transform)
+                
+                x_robot = p_chassis.point.x
+                y_robot = p_chassis.point.y
+                z_robot = p_chassis.point.z
+                #print(f"Robot frame:  x={x_robot:.2f}, y={y_robot:.2f}, z={z_robot:.2f}")
+                
+                # Filtra punti validi
+                if (0.3 < x_robot <= 3.0 and
+                    abs(y_robot) < 3.0 and
+                    -0.5 < z_robot < 2.5):
+                    
+                    #print(f"Trasformato: camera[{x:.2f},{y:.2f},{z:.2f}] -> chassis[{x_robot:.2f},{y_robot:.2f},{z_robot:.2f}]")
+                    objects_detected.append([x_robot, y_robot, z_robot])
+                    
+            except Exception as e:
+                self.node.get_logger().error(f"Errore trasformazione punto: {e}")
+                continue
+        
+        # Clusterizza gli ostacoli
+        claustered_objects = self.obstacle_detector.cluster_obstacles(objects_detected)
+        for obstacle in claustered_objects:
+            obstacles.append(obstacle['centroid'])
+        
         return obstacles
+
 
 
 def main():
@@ -388,6 +387,13 @@ def main():
     ROS_DISTRO = os.environ.get('ROS_DISTRO')
     qos = QoSProfile(depth=10)
     node = rclpy.create_node('apt_keyboard')
+    node.set_parameters([
+        rclpy.parameter.Parameter(
+            'use_sim_time',
+            rclpy.Parameter.Type.BOOL,
+            True
+        )
+    ])
 
     status = 0
     target_linear_velocity = 0.0
