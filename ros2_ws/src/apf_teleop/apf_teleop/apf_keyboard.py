@@ -19,6 +19,7 @@ from rclpy.qos import QoSProfile
 
 from pyclustering.cluster.dbscan import dbscan
 from pyclustering.utils import timedcall
+import tf2_geometry_msgs 
 from tf2_ros import Buffer, TransformListener
 
 
@@ -284,12 +285,13 @@ class APFController:
         self.apf = ArtificialPotentialField(APF_CONFIG)
         self.obstacle_detector = obstacle_detector_instance
         
-        self.tf_buffer = Buffer()
+        self.tf_buffer = Buffer(cache_time=rclpy.duration.Duration(seconds=10.0))
         self.tf_listener = TransformListener(self.tf_buffer, node)
 
         #self.obstacle_centroids = [] -0.05 -0.04 0.02    x=2.83, y=1.17, z=0.32
 
     def point_cloud_callback(self, msg):
+        #self.node.get_logger().info(f"PointCloud callback chiamata, frame={msg.header.frame_id}, punti={len(msg.data)} bytes")
         try:
             obstacles = self.get_obstacle_positions(msg)
             self.apf.obstacles = obstacles
@@ -307,67 +309,73 @@ class APFController:
         y_offset = 4    # Il secondo è Y (4 bytes dopo)  
         z_offset = 8    # Il terzo è Z (8 bytes dopo) - QUESTA È LA PROFONDITÀ!
         
-         # 2. SCORRI TUTTI I PUNTI
-        for i in range(0, len(msg.data), 5 * msg.point_step):
-            point_data = msg.data[i:i + msg.point_step]
-            #print('point_data:', point_data)
+        def get_obstacle_positions(self, msg):
+            obstacles = []
+            objects_detected = []
             
-            # 3. ESTRAI COORDINATE 3D
-            x = struct.unpack('f', point_data[x_offset:x_offset+4])[0] 
-            y = struct.unpack('f', point_data[y_offset:y_offset+4])[0]  
-            z = struct.unpack('f', point_data[z_offset:z_offset+4])[0] 
+            x_offset = 0
+            y_offset = 4
+            z_offset = 8
             
-            p = PointStamped()
-            p.header.frame_id = msg.header.frame_id  # es: zed_left_camera_frame
-            p.header.stamp = msg.header.stamp
-            p.point.x = x
-            p.point.y = y
-            p.point.z = z
-
-            # Trasforma nel frame del robot
+            # Verifica che il TF sia disponibile PRIMA di processare i punti
             try:
+                # Cerca la trasformazione con timeout più lungo
                 transform = self.tf_buffer.lookup_transform(
-                    'chassis_link',
-                    p.header.frame_id,
-                    p.header.stamp
+                    'chassis_link',  # target frame
+                    msg.header.frame_id,  # source frame (zed_left_camera_frame)
+                    rclpy.time.Time(),
+                    # Time.from_msg(msg.header.stamp),
+                    timeout=rclpy.duration.Duration(seconds=1.0)  # Timeout 1 secondo
                 )
+                self.node.get_logger().info(f"TF trovato: {msg.header.frame_id} -> chassis_link")
                 
-                p_chassis = tf2_geometry_msgs.do_transform_point(p, transform)
-
-                x = p_chassis.point.x
-                y = p_chassis.point.y
-                z = p_chassis.point.z
-
             except Exception as e:
-                self.node.get_logger().warn("TF non disponibile")
-                continue
-
-            #x, y = -y, x
+                self.node.get_logger().warn(f"TF non disponibile: {e}")
+                return []  # Ritorna lista vuota se non c'è TF
             
-            #if not np.isnan(x) and not np.isinf(x) and \ -0.05 -0.04 0.02
-               #not np.isnan(y) and not np.isinf(y) and \
-               #not np.isnan(z) and not np.isinf(z):  # Solo primi 5 punti per non intasare
-            #if not np.isinf(x):
-                #print(f"Punto {i//msg.point_step}: x={x:.3f}, y={y:.3f}, z={z:.3f}")
-            
-            if (0.3 < x <= 3.0 and      # Distanza: 0.3-5.0 metri
-                abs(y) < 3.0 and        # Laterale: ±3.0 metri
-                -0.5 < z < 2.5 and      # Altezza: sopra pavimento, sotto 2.5m
-                x != 680.68):           # Filtra valori corrotti
-
-                print(f"RAW: x={x:.2f}, y={y:.2f}, z={z:.2f}")
-                objects_detected.append([x, y, z])
-                #self.pointcloud_points.append([x, y, z])
+            # Ora processa i punti
+            for i in range(0, len(msg.data), msg.point_step):
+                point_data = msg.data[i:i + msg.point_step]
                 
-        claustered_objects = self.obstacle_detector.cluster_obstacles(objects_detected)
-        for obstacle in claustered_objects:
-            """cx, cy, cz = obstacle['centroid']
-            # filtro il pavimento
-            if cz < 0.5:
-                continue"""
-            obstacles.append(obstacle['centroid'])
-            #self.obstacle_centroids.append(obstacle['centroid'])
-        
+                x = struct.unpack('f', point_data[x_offset:x_offset+4])[0] 
+                y = struct.unpack('f', point_data[y_offset:y_offset+4])[0]  
+                z = struct.unpack('f', point_data[z_offset:z_offset+4])[0]
+                
+                # Crea il punto nel frame della camera
+                p = PointStamped()
+                p.header.frame_id = msg.header.frame_id
+                p.header.stamp = msg.header.stamp
+                p.point.x = x
+                p.point.y = y
+                p.point.z = z
+
+                # Trasforma nel frame del robot (usa il transform già ottenuto)
+                try:
+                    p_chassis = tf2_geometry_msgs.do_transform_point(p, transform)
+                    
+                    x_robot = p_chassis.point.x
+                    y_robot = p_chassis.point.y
+                    z_robot = p_chassis.point.z
+                    print(f"Robot frame:  x={x_robot:.2f}, y={y_robot:.2f}, z={z_robot:.2f}")
+                    
+                    # Filtra punti validi
+                    if (0.3 < x_robot <= 3.0 and
+                        abs(y_robot) < 3.0 and
+                        -0.5 < z_robot < 2.5):
+                        
+                        print(f"Trasformato: camera[{x:.2f},{y:.2f},{z:.2f}] -> chassis[{x_robot:.2f},{y_robot:.2f},{z_robot:.2f}]")
+                        objects_detected.append([x_robot, y_robot, z_robot])
+                        
+                except Exception as e:
+                    self.node.get_logger().error(f"Errore trasformazione punto: {e}")
+                    continue
+            
+            # Clusterizza gli ostacoli
+            claustered_objects = self.obstacle_detector.cluster_obstacles(objects_detected)
+            for obstacle in claustered_objects:
+                obstacles.append(obstacle['centroid'])
+            
+            return obstacles
         return obstacles
 
 
