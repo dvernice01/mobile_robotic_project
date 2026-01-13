@@ -64,10 +64,10 @@ Communications Failed
 
 # vettore dei guadagni 
 APF_CONFIG = {
-    'repulsive_gain': 2.0,      # Guadagno forza repulsiva
-    'attractive_gain': 2.0,     # Guadagno forza attrattiva  
+    'repulsive_gain': 0.1,      # Guadagno forza repulsiva
+    'attractive_gain': 5.0,     # Guadagno forza attrattiva  
     'LIN_VELOCITY_GAIN': 1.0,
-    'ANG_VELOCITY_GAIN': 0.2,
+    'ANG_VELOCITY_GAIN': 0.1,
 }
 
 # get_key serve a prendere il singolo tasto premuto.
@@ -176,7 +176,7 @@ class ObstacleDetector:
         for point in pointcloud_data:
             x, y, z = point
             # Usa solo punti validi per il clustering
-            if 0.3 < x <= 3.0 and z > -0.5:  # e z >= 0.4 se vuoi
+            if 0.3 < x <= 1.0 and z > -0.5:  # e z >= 0.4 se vuoi
                 points_2d.append([x, y])  # DBSCAN su coordinate 2D
                 valid_points_3d.append(point)
         
@@ -258,7 +258,7 @@ class ArtificialPotentialField:
     def compute_repulsive_forces(self, x_dist, angle):
 
         gamma = 1
-        eta_0 = 3
+        eta_0 = 1
         eta_i = x_dist * np.sin(angle)
         print(eta_i)
         eta_i = np.sign(eta_i) * max(abs(eta_i), 0.1)
@@ -289,11 +289,31 @@ class APFController:
         
         self.tf_buffer = Buffer(cache_time=rclpy.duration.Duration(seconds=10.0))
         self.tf_listener = TransformListener(self.tf_buffer, node)
+        
+        self.last_pc_msg = None
+        self.timer = node.create_timer(
+            0.2,  # 5 Hz
+            self.process_pointcloud
+        )
 
         #self.obstacle_centroids = [] -0.05 -0.04 0.02    x=2.83, y=1.17, z=0.32
 
+    def process_pointcloud(self):
+        if self.last_pc_msg is None:
+            return
+
+        msg = self.last_pc_msg
+
+        """try:
+            obstacles = self.get_obstacle_positions(msg)
+            self.apf.obstacles = obstacles
+        except Exception as e:
+            self.node.get_logger().warn(f"Process PC failed: {e}")"""
+
+    
     def point_cloud_callback(self, msg):
         #self.node.get_logger().info(f"PointCloud callback chiamata, frame={msg.header.frame_id}, punti={len(msg.data)} bytes")
+        self.last_pc_msg = msg
         try:
             obstacles = self.get_obstacle_positions(msg)
             self.apf.obstacles = obstacles
@@ -323,10 +343,10 @@ class APFController:
             transform = self.tf_buffer.lookup_transform(
                 'zed_camera_link',  # target frame
                 msg.header.frame_id,              # source
-                msg_time,                         
-                timeout=Duration(seconds=0.5)
+                msg.header.stamp,
+                timeout=rclpy.duration.Duration(seconds=0.2)
             )
-            self.node.get_logger().info(f"TF trovato: {msg.header.frame_id} -> chassis_link")
+            #self.node.get_logger().info(f"TF trovato: {msg.header.frame_id} -> chassis_link")
             
         except Exception as e:
             self.node.get_logger().warn(f"TF non disponibile: {e}")
@@ -339,6 +359,10 @@ class APFController:
             x = struct.unpack('f', point_data[x_offset:x_offset+4])[0] 
             y = struct.unpack('f', point_data[y_offset:y_offset+4])[0]  
             z = struct.unpack('f', point_data[z_offset:z_offset+4])[0]
+            
+            if not math.isfinite(x) or not math.isfinite(y) or not math.isfinite(z):
+                continue
+
             
             # Crea il punto nel frame della camera
             p = PointStamped()
@@ -358,7 +382,7 @@ class APFController:
                 #print(f"Robot frame:  x={x_robot:.2f}, y={y_robot:.2f}, z={z_robot:.2f}")
                 
                 # Filtra punti validi
-                if (0.3 < x_robot <= 3.0 and
+                if (0.1 < x_robot <= 1.0 and
                     abs(y_robot) < 3.0 and
                     -0.5 < z_robot < 2.5):
                     
@@ -458,7 +482,7 @@ def main():
                     #else: 
                     if force < 0:
                         sign = np.sign(distance[1])
-                        final_ang_vel = -(sign*abs(force))
+                        final_ang_vel = -(sign*abs(force))* APF_CONFIG['ANG_VELOCITY_GAIN']
                     else:
                         final_ang_vel = control_angular_velocity
                         
