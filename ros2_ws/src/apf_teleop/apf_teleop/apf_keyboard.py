@@ -1,35 +1,37 @@
-#debug
 import os
 import select
 import sys
-
-#librerie importate da me 
 import math
 import struct
 import numpy as np
-
-from geometry_msgs.msg import Twist
-from geometry_msgs.msg import TwistStamped
-from geometry_msgs.msg import PointStamped
-
-from sensor_msgs.msg import PointCloud2
 import rclpy
-from rclpy.clock import Clock
-from rclpy.qos import QoSProfile
-from rclpy.time import Time
-from rclpy.duration import Duration
-
-from pyclustering.cluster.dbscan import dbscan
-from pyclustering.utils import timedcall
 import tf2_geometry_msgs 
-from tf2_ros import Buffer, TransformListener
-
 
 if os.name == 'nt':
     import msvcrt
 else:
     import termios
     import tty
+
+from geometry_msgs.msg import Twist, TwistStamped, PointStamped
+from sensor_msgs.msg import PointCloud2
+
+from rclpy.clock import Clock
+from rclpy.qos import QoSProfile
+from rclpy.time import Time
+from rclpy.duration import Duration
+from rclpy.node import Node
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import (
+    MutuallyExclusiveCallbackGroup,
+    ReentrantCallbackGroup
+)
+
+from pyclustering.cluster.dbscan import dbscan
+from pyclustering.utils import timedcall
+
+from tf2_ros import Buffer, TransformListener
+
 
 BURGER_MAX_LIN_VEL = 2.22
 BURGER_MAX_ANG_VEL = 2.84
@@ -70,7 +72,6 @@ APF_CONFIG = {
     'ANG_VELOCITY_GAIN': 0.1,
 }
 
-# get_key serve a prendere il singolo tasto premuto.
 def get_key(settings):
     if os.name == 'nt': #definisce quale sistema operativo sta usando  
         return msvcrt.getch().decode('utf-8')
@@ -151,74 +152,164 @@ def update_velocity(pub,ROS_DISTRO,lin_velocity, ang_velocity):
         twist_stamped.twist.angular.y = 0.0
         twist_stamped.twist.angular.z = ang_velocity
         pub.publish(twist)
+
+
+class PerceptionNode(Node):
+
+    def __init__(self):
+        
+        super().__init__('perception_node')
+        self.object_pub = PointStamped ()
+        self.cb_group = ReentrantCallbackGroup()
+        self.pub = self.create_publisher(PointCloud2, '/filtered_pc', 10)
+        self.sub = self.create_subscription(
+            PointCloud2,
+            '/zed/zed_node/point_cloud/cloud_registered',
+            self.perception_callback,
+            10,
+            callback_group=self.cb_group
+        )
         
         
+    def perception_callback(self, msg):
         
-class ObstacleDetector:
-    def __init__(self, eps=0.5, min_points=3):
-        """
-        DBSCAN parameters:
-        - eps: distance threshold for neighborhood (in meters)
-        - min_points: minimum points to form a cluster
-        """
-        self.eps = eps
-        self.min_points = min_points
+        objects = self.get_obstacle_positions(msg)
+        self.object_pub.point.x = objects[0]
+        self.object_pub.point.y = objects[1]
+        self.object_pub.point.z = objects[2]
+        self.pub.publish(self.object_pub)
+        
+        
+    def get_obstacle_positions(self, msg):
+        
+        obstacles = []
+        objects_detected = []
+        x_offset = 0
+        y_offset = 4
+        z_offset = 8
+        
+        #now = self.node.get_clock().now()
+        msg_time = Time.from_msg(msg.header.stamp)
+        
+        # Verifica che il TF sia disponibile PRIMA di processare i punti
+        try:
+            # Cerca la trasformazione con timeout più lungo
+            transform = self.tf_buffer.lookup_transform(
+                'zed_camera_link',    # target frame
+                msg.header.frame_id,  # source
+                msg.header.stamp,
+                timeout=rclpy.duration.Duration(seconds=0.2)
+            )
+            
+            
+        except Exception as e:
+            self.node.get_logger().warn(f"TF non disponibile: {e}")
+            return []  # Ritorna lista vuota se non c'è TF
+        
+        # Ora processa i punti
+        for i in range(0, len(msg.data), msg.point_step):
+            point_data = msg.data[i:i + msg.point_step]
+            
+            x = struct.unpack('f', point_data[x_offset:x_offset+4])[0] 
+            y = struct.unpack('f', point_data[y_offset:y_offset+4])[0]  
+            z = struct.unpack('f', point_data[z_offset:z_offset+4])[0]
+
+            
+            if not math.isfinite(x) or not math.isfinite(y) or not math.isfinite(z):
+                continue
+
+            # Crea il punto nel frame della camera
+            p = PointStamped()
+            p.header.frame_id = msg.header.frame_id
+            p.header.stamp = msg.header.stamp
+            p.point.x = x
+            p.point.y = y
+            p.point.z = z
+
+            # Trasforma nel frame del robot (usa il transform già ottenuto)
+            try:
+                p_chassis = tf2_geometry_msgs.do_transform_point(p, transform)
+                
+                x_robot = p_chassis.point.x
+                y_robot = p_chassis.point.y
+                z_robot = p_chassis.point.z
+                
+                # Filtra punti validi
+                if (0.1 < x_robot <= 1.0 and
+                    abs(y_robot) < 3.0 and
+                    -0.5 < z_robot < 2.5):
+                    
+                    #print(f"Trasformato: camera[{x:.2f},{y:.2f},{z:.2f}] -> chassis[{x_robot:.2f},{y_robot:.2f},{z_robot:.2f}]")
+                    objects_detected.append([x_robot, y_robot, z_robot])
+                    
+            except Exception as e:
+                self.node.get_logger().error(f"Errore trasformazione punto: {e}")
+                continue  
+            
+        return [x_robot, y_robot, z_robot]  
+            
+#L'OBIETTIVO E' FARE UN CLAUSTER AL FINE DI RICONOSCERE GLI OSTACOLI COSÌ DA FARE IL CONTROLLO RISPETTO AD UN 
+# OSTACOLO PIUTTOSTO CHE DA CIASCUN PUNTO
+           
+class DBSCANNode(Node):
+    
+    def __init__(self):
+        
+        self.cb_group = ReentrantCallbackGroup()
+        self.pub = self.create_publisher(PointStamped, '/obstacles', 10)
+        self.sub = self.create_subscription(
+            PointCloud2,
+            '/filtered_pc',
+            self.dbscan_callback,
+            10,
+            callback_group=self.cb_group
+        )
         
     def cluster_obstacles(self, pointcloud_data):
-        """Clusterizza i punti per identificare ostacoli separati"""
+        
         if not pointcloud_data:
             return []
         
-        # 1. Prepara i dati per DBSCAN (solo coordinate x,y per clustering 2D)
-        points_2d = []
         valid_points_3d = []
-        
-        for point in pointcloud_data:
-            x, y, z = point
-            # Usa solo punti validi per il clustering
-            if 0.3 < x <= 1.0 and z > -0.5:  # e z >= 0.4 se vuoi
-                points_2d.append([x, y])  # DBSCAN su coordinate 2D
-                valid_points_3d.append(point)
-        
-        if len(points_2d) < self.min_points:
-            return []
-        
-        # 2. Applica DBSCAN
-        dbscan_instance = dbscan(points_2d, self.eps, self.min_points)
-        
-        # Misura il tempo di esecuzione
-        time_execution, _ = timedcall(dbscan_instance.process)
-        
-        # 3. Estrai i cluster
-        clusters = dbscan_instance.get_clusters()
-        noise = dbscan_instance.get_noise()
-        
-        print(f"DBSCAN trovato {len(clusters)} ostacoli, {len(noise)} punti rumore in {time_execution:.3f}s")
-        
-        # 4. Converti i cluster in ostacoli 3D
-        obstacles_3d = []
-        
-        for cluster_indices in clusters:
-            cluster_points = []
-            for idx in cluster_indices:
-                cluster_points.append(valid_points_3d[idx])
+        for points in pointcloud_data:
+            valid_points_3d.append(points)        
             
-            # Calcola il centroide dell'ostacolo
-            if cluster_points:
-                centroid = self.calculate_centroid(cluster_points)
-                obstacles_3d.append({
-                    'centroid': centroid,  # [x, y, z] del centro
-                    'points': cluster_points,  # Tutti i punti del cluster
-                    'size': len(cluster_points),
-                    'distance': math.sqrt(centroid[0]**2 + centroid[1]**2 + centroid[2]**2)
-                })
-        
+            if len(valid_points_3d) < self.min_points:
+                return []
+            
+            # 2. Applica DBSCAN
+            dbscan_instance = dbscan(valid_points_3d, self.eps, self.min_points)
+            
+            # Misura il tempo di esecuzione
+            time_execution, _ = timedcall(dbscan_instance.process)
+            
+            # 3. Estrai i cluster
+            clusters = dbscan_instance.get_clusters()
+            
+            print(f"DBSCAN trovato {len(clusters)} ostacoli in {time_execution:.3f}s")
+            
+            # 4. Converti i cluster in ostacoli 3D
+            obstacles_3d = []
+            
+            for cluster_indices in clusters:
+                cluster_points = []
+                        
+                # Calcola il centroide dell'ostacolo
+                if cluster_points:
+                    centroid = self.calculate_centroid(cluster_points)
+                    obstacles_3d.append({
+                        'centroid': centroid,  # [x, y, z] del centro
+                        'points': cluster_points,  # Tutti i punti del cluster
+                        'size': len(cluster_points),
+                        'distance': math.sqrt(centroid[0]**2 + centroid[1]**2 + centroid[2]**2)
+                    })
+            
         return obstacles_3d
     
     def calculate_centroid(self, points):
-        """Calcola il centroide di un cluster di punti"""
+
         if not points:
-            return [0, 0, 0]
+            return None
         
         sum_x = sum(p[0] for p in points)
         sum_y = sum(p[1] for p in points) 
@@ -239,14 +330,73 @@ class ObstacleDetector:
             return None
         return min(obstacles, key=lambda x: x['distance'])
 
+    def dbscan_callback(self, msg):
+        
+        obstacles = self.cluster_obstacles(msg)
 
-class ArtificialPotentialField:
-    #definisco le varie funzioni della classe 
-    # nella funzione init definisco la configurazione e il vettore degli ostacoli 
-    def __init__(self, config):
-        self.config = config
-        self.obstacles = []  
+        for o in obstacles:
+            p = PointStamped()
+            p.point.x, p.point.y, p.point.z = o
+            self.pub.publish(p)
+            
+class TeleopNode(Node):
+
+    def __init__(self):
+
+        self.cb_group = MutuallyExclusiveCallbackGroup()
+        self.pub = self.create_publisher(Twist, '/cmd_vel_teleop', 10)
+        self.create_subscription(
+            PointStamped, '/obstacles', self.teleop_callback, 10, callback_group=self.cb_group
+        )
+
+        self.target_lin = 0.0
+        self.target_ang = 0.0
+        self.ctrl_lin = 0.0
+        self.ctrl_ang = 0.0
+
+        self.settings = termios.tcgetattr(sys.stdin)
+        self.timer = self.create_timer(0.05, self.loop, callback_group=self.cb_group)
+
+
+    def teleop_callback(self,obstacles):
+        
+        if len(obstacles) > 0:
+            return
+        else:
+            key = get_key(self.settings)
+
+            if key == 'w':
+                self.target_lin = check_linear_limit_velocity(self.target_lin + LIN_VEL_STEP_SIZE)
+            elif key == 'x':
+                self.target_lin = check_linear_limit_velocity(self.target_lin - LIN_VEL_STEP_SIZE)
+            elif key == 'a':
+                self.target_ang = check_angular_limit_velocity(self.target_ang + ANG_VEL_STEP_SIZE)
+            elif key == 'd':
+                self.target_ang = check_angular_limit_velocity(self.target_ang - ANG_VEL_STEP_SIZE)
+            elif key == ' ':
+                self.target_lin = self.target_ang = 0.0
+
+            self.ctrl_lin = make_simple_profile(self.ctrl_lin, self.target_lin, LIN_VEL_STEP_SIZE / 2)
+            self.ctrl_ang = make_simple_profile(self.ctrl_ang, self.target_ang, ANG_VEL_STEP_SIZE / 2)
+
+            update_velocity(pub,ROS_DISTRO,self.ctrl_lin, self.ctrl_ang)
+            
+            
+class APFNode(Node):
     
+    def __init__(self):
+        
+        self.teleop_vel = 0
+        self.obstacle = []
+        self.cb_group = MutuallyExclusiveCallbackGroup()
+        self.pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.create_subscription(
+            PointStamped, '/obstacles', self.apf_callback, 10, callback_group=self.cb_group
+        )
+        self.create_subscription(
+            Twist, '/cmd_vel_teleop', self.apfTeleop_callback, 10, callback_group=self.cb_group
+        )
+        
     def compute_attractive_forces(self, v_lin, angle):
         
         #attractive_force = self.config['attractive_gain'] * (v_lin * np.sin (np.arctan2(y_dist, x_dist)))
@@ -260,7 +410,6 @@ class ArtificialPotentialField:
         gamma = 1
         eta_0 = 1
         eta_i = x_dist * np.sin(angle)
-        print(eta_i)
         eta_i = np.sign(eta_i) * max(abs(eta_i), 0.1)
         repulsive_force = (self.config['repulsive_gain']/eta_i**2) * ((1/eta_i - 1/eta_0)**(gamma - 1))
         
@@ -275,305 +424,51 @@ class ArtificialPotentialField:
         total_force = attractive_force - repulsive_force
          
         return [ new_lin_vel, total_force, angle ]
-
-
-class APFController:
-
-    def __init__(self, node, ros_distro, control_linear_velocity, control_angular_velocity, obstacle_detector_instance):
-        self.node = node
-        self.ros_distro = ros_distro
-        self.control_linear_velocity = control_linear_velocity
-        self.control_angular_velocity = control_angular_velocity
-        self.apf = ArtificialPotentialField(APF_CONFIG)
-        self.obstacle_detector = obstacle_detector_instance
-        
-        self.tf_buffer = Buffer(cache_time=rclpy.duration.Duration(seconds=10.0))
-        self.tf_listener = TransformListener(self.tf_buffer, node)
-        
-        self.last_pc_msg = None
-        self.timer = node.create_timer(
-            0.2,  # 5 Hz
-            self.process_pointcloud
-        )
-
-        #self.obstacle_centroids = [] -0.05 -0.04 0.02    x=2.83, y=1.17, z=0.32
-
-    def process_pointcloud(self):
-        if self.last_pc_msg is None:
-            return
-
-        msg = self.last_pc_msg
-
-        """try:
-            obstacles = self.get_obstacle_positions(msg)
-            self.apf.obstacles = obstacles
-        except Exception as e:
-            self.node.get_logger().warn(f"Process PC failed: {e}")"""
-
     
-    def point_cloud_callback(self, msg):
-        #self.node.get_logger().info(f"PointCloud callback chiamata, frame={msg.header.frame_id}, punti={len(msg.data)} bytes")
-        self.last_pc_msg = msg
-        try:
-            obstacles = self.get_obstacle_positions(msg)
-            self.apf.obstacles = obstacles
-
-        except Exception as e:
-            self.node.get_logger().error(f"Errore pointcloud: {e}")
-
-    def get_obstacle_positions(self, msg):
-        obstacles = []
-        objects_detected = []
+    def apfTeleop_callback(self, TeleoperationVel):
         
-        x_offset = 0
-        y_offset = 4
-        z_offset = 8
+        self.teleop_vel = TeleoperationVel
+    
+    def apf_callback(self,obstacles):
         
-        now = self.node.get_clock().now()
-        msg_time = Time.from_msg(msg.header.stamp)
-
-        # 🔴 SCARTA POINTCLOUD VECCHIE (>0.5s)
-        if (now - msg_time).nanoseconds > 5e8:
-            self.node.get_logger().warn("PointCloud troppo vecchia, scarto")
-            return []
+        for o in obstacles:
+            
+            self.obstacle = o
+            distance_x = o[0]
+            distance_y = o[1]
+            distance_z = o[2]
         
-        # Verifica che il TF sia disponibile PRIMA di processare i punti
-        try:
-            # Cerca la trasformazione con timeout più lungo
-            transform = self.tf_buffer.lookup_transform(
-                'zed_camera_link',  # target frame
-                msg.header.frame_id,              # source
-                msg.header.stamp,
-                timeout=rclpy.duration.Duration(seconds=0.2)
-            )
-            #self.node.get_logger().info(f"TF trovato: {msg.header.frame_id} -> chassis_link")
+        if len(obstacles < 1):
             
-        except Exception as e:
-            self.node.get_logger().warn(f"TF non disponibile: {e}")
-            return []  # Ritorna lista vuota se non c'è TF
-        
-        # Ora processa i punti
-        for i in range(0, len(msg.data), msg.point_step):
-            point_data = msg.data[i:i + msg.point_step]
-            
-            x = struct.unpack('f', point_data[x_offset:x_offset+4])[0] 
-            y = struct.unpack('f', point_data[y_offset:y_offset+4])[0]  
-            z = struct.unpack('f', point_data[z_offset:z_offset+4])[0]
-            
-            if not math.isfinite(x) or not math.isfinite(y) or not math.isfinite(z):
-                continue
-
-            
-            # Crea il punto nel frame della camera
-            p = PointStamped()
-            p.header.frame_id = msg.header.frame_id
-            p.header.stamp = msg.header.stamp
-            p.point.x = x
-            p.point.y = y
-            p.point.z = z
-
-            # Trasforma nel frame del robot (usa il transform già ottenuto)
-            try:
-                p_chassis = tf2_geometry_msgs.do_transform_point(p, transform)
-                
-                x_robot = p_chassis.point.x
-                y_robot = p_chassis.point.y
-                z_robot = p_chassis.point.z
-                #print(f"Robot frame:  x={x_robot:.2f}, y={y_robot:.2f}, z={z_robot:.2f}")
-                
-                # Filtra punti validi
-                if (0.1 < x_robot <= 1.0 and
-                    abs(y_robot) < 3.0 and
-                    -0.5 < z_robot < 2.5):
-                    
-                    #print(f"Trasformato: camera[{x:.2f},{y:.2f},{z:.2f}] -> chassis[{x_robot:.2f},{y_robot:.2f},{z_robot:.2f}]")
-                    objects_detected.append([x_robot, y_robot, z_robot])
-                    
-            except Exception as e:
-                self.node.get_logger().error(f"Errore trasformazione punto: {e}")
-                continue
-        
-        # Clusterizza gli ostacoli
-        claustered_objects = self.obstacle_detector.cluster_obstacles(objects_detected)
-        for obstacle in claustered_objects:
-            obstacles.append(obstacle['centroid'])
-        
-        return obstacles
-
-
-
-def main():
-    settings = None
-    if os.name != 'nt':
-        settings = termios.tcgetattr(sys.stdin)
-
-    rclpy.init()
-    ROS_DISTRO = os.environ.get('ROS_DISTRO')
-    qos = QoSProfile(depth=10)
-    node = rclpy.create_node('apt_keyboard')
-    node.set_parameters([
-        rclpy.parameter.Parameter(
-            'use_sim_time',
-            rclpy.Parameter.Type.BOOL,
-            True
-        )
-    ])
-
-    status = 0
-    target_linear_velocity = 0.0
-    target_angular_velocity = 0.0
-    control_linear_velocity = 0.0
-    control_angular_velocity = 0.0
-
-    # Crea il controller APF
-   #apf_controller = APFController(node, ROS_DISTRO, control_linear_velocity, control_angular_velocity,pub)
-    obstacle_detector_instance = ObstacleDetector(eps=0.2, min_points=5)
-   
-    if ROS_DISTRO == 'humble':
-        pub = node.create_publisher(Twist, 'cmd_vel', qos)
-            # Crea il controller APF
-        apf_controller = APFController(node, ROS_DISTRO, control_linear_velocity, control_angular_velocity, obstacle_detector_instance)
-        sub_pointcloud = node.create_subscription(
-            PointCloud2,
-            '/zed/zed_node/point_cloud/cloud_registered',
-            apf_controller.point_cloud_callback,
-            qos)
-    else:
-        pub = node.create_publisher(TwistStamped, 'cmd_vel', qos)
-            # Crea il controller APF
-        apf_controller = APFController(node, ROS_DISTRO, control_linear_velocity, control_angular_velocity, obstacle_detector_instance)
-        sub_pointcloud = node.create_subscription(
-            PointCloud2,
-            '/zed/zed_node/point_cloud/cloud_registered',
-            apf_controller.point_cloud_callback,
-            qos)
-
-    try:
-        print(msg)
-
-        while True:
-            rclpy.spin_once(node, timeout_sec=0.01)
-           
-            if len(apf_controller.apf.obstacles) > 0 and control_linear_velocity >= 0.3:
-                print("APF attivo, numero ostacoli:", len(apf_controller.apf.obstacles))
-
-                # Modalità APF
-                for obstacle in apf_controller.apf.obstacles:
-                    x, y, z = obstacle
-                    distance = [x, y, z]
-
-                    [ velocity, force, angle ] = apf_controller.apf.compute_total_force(
-                        control_linear_velocity, 
-                        distance
-                    )
-                    """print('velocities:', velocities[0], velocities[1])
-                    MAX_VEL = 2.0
-                    
-                    if abs(velocities[0]) > MAX_VEL:
-                        velocities[0] = np.sign(velocities[0]) * MAX_VEL
-                       
-                    if abs(velocities[1]) > MAX_VEL:
-                        velocities[1] = np.sign(velocities[1]) * MAX_VEL"""
-                    
-                    #final_lin_vel = control_linear_velocity - (np.sign (control_linear_velocity) * velocities[0] * APF_CONFIG['LIN_VELOCITY_GAIN'])
-                    final_lin_vel = velocity * APF_CONFIG['LIN_VELOCITY_GAIN']
-                    #if velocities[1] == 1:
-                    #    final_ang_vel = 0
-                    #else: 
-                    if force < 0:
-                        sign = np.sign(distance[1])
-                        final_ang_vel = -(sign*abs(force))* APF_CONFIG['ANG_VELOCITY_GAIN']
-                    else:
-                        final_ang_vel = control_angular_velocity
-                        
-                    final_ang_vel = check_angular_limit_velocity (final_ang_vel)
-                    #final_ang_vel = control_angular_velocity - (np.sign (control_linear_velocity) * velocities[1] * APF_CONFIG['ANG_VELOCITY_GAIN'])
-                    #final_ang_vel = - velocities[1] * APF_CONFIG['ANG_VELOCITY_GAIN']
-                    
-                update_velocity(pub,ROS_DISTRO, final_lin_vel, final_ang_vel)
-                print('velocities: ', final_lin_vel, final_ang_vel)
-
-            else:
-
-                key = get_key(settings)
-                if key == 'w':
-                    target_linear_velocity =\
-                        check_linear_limit_velocity(target_linear_velocity + LIN_VEL_STEP_SIZE)
-                    status = status + 1
-                    print_vels(target_linear_velocity, target_angular_velocity)
-                elif key == 'x':
-                    target_linear_velocity =\
-                        check_linear_limit_velocity(target_linear_velocity - LIN_VEL_STEP_SIZE)
-                    status = status + 1
-                    print_vels(target_linear_velocity, target_angular_velocity)
-                elif key == 'a':
-                    target_angular_velocity =\
-                        check_angular_limit_velocity(target_angular_velocity + ANG_VEL_STEP_SIZE)
-                    status = status + 1
-                    print_vels(target_linear_velocity, target_angular_velocity)
-                elif key == 'd':
-                    target_angular_velocity =\
-                        check_angular_limit_velocity(target_angular_velocity - ANG_VEL_STEP_SIZE)
-                    status = status + 1
-                    print_vels(target_linear_velocity, target_angular_velocity)
-                elif key == ' ' or key == 's':
-                    target_linear_velocity = 0.0
-                    control_linear_velocity = 0.0
-                    target_angular_velocity = 0.0
-                    control_angular_velocity = 0.0
-                    print_vels(target_linear_velocity, target_angular_velocity)
-                else:
-                    if (key == '\x03'):
-                        break
-
-                if status == 20:
-                    print(msg)
-                    status = 0
-
-                control_linear_velocity = make_simple_profile(
-                    control_linear_velocity,
-                    target_linear_velocity,
-                    (LIN_VEL_STEP_SIZE / 2.0))
-  
-                control_angular_velocity = make_simple_profile(
-                    control_angular_velocity,
-                    target_angular_velocity,
-                    (ANG_VEL_STEP_SIZE / 2.0))
-                
-                update_velocity(pub, ROS_DISTRO, control_linear_velocity, control_angular_velocity)
-            
-            
-
-
-    except Exception as e:
-        print(e)
-
-    finally:
-        if ROS_DISTRO == 'humble':
-            twist = Twist()
-            twist.linear.x = 0.0
-            twist.linear.y = 0.0
-            twist.linear.z = 0.0
-            twist.angular.x = 0.0
-            twist.angular.y = 0.0
-            twist.angular.z = 0.0
-            pub.publish(twist)
+            self.pub.publish(self.teleop_vel)
         else:
-            twist_stamped = TwistStamped()
-            twist_stamped.header.stamp = Clock().now().to_msg()
-            twist_stamped.header.frame_id = ''
-            twist_stamped.twist.linear.x = control_linear_velocity
-            twist_stamped.twist.linear.y = 0.0
-            twist_stamped.twist.linear.z = 0.0
-            twist_stamped.twist.angular.x = 0.0
-            twist_stamped.twist.angular.y = 0.0
-            twist_stamped.twist.angular.z = control_angular_velocity
-            pub.publish(twist_stamped)
             
+            [apf_lin_vel, apf_ang_vel, angle] = compute_total_force(self, self.teleop_vel, self.obstacle)
+            self.ctrl_lin = make_simple_profile(self.ctrl_lin, apf_lin_vel, LIN_VEL_STEP_SIZE / 2)
+            self.ctrl_ang = make_simple_profile(self.ctrl_ang, apf_ang_vel, ANG_VEL_STEP_SIZE / 2)
 
-        if os.name != 'nt':
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings)
+            update_velocity(self.pub,ROS_DISTRO,self.ctrl_lin, self.ctrl_ang)
+            
+            
+def main():
+    rclpy.init()
+
+    executor = MultiThreadedExecutor(num_threads=4)
+
+    nodes = [
+        PerceptionNode(),
+        DBSCANNode(),
+        TeleopNode(),
+        APFNode()
+    ]
+
+    for n in nodes:
+        executor.add_node(n)
+
+    executor.spin()
 
 
-if __name__ == '__main__': 
+if __name__ == '__main__':
     main()
+        
+ 
