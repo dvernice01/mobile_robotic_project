@@ -15,6 +15,8 @@ else:
 
 from geometry_msgs.msg import Twist, TwistStamped, PointStamped
 from sensor_msgs.msg import PointCloud2
+from sensor_msgs.msg import PointField
+from sensor_msgs_py import point_cloud2
 
 from rclpy.clock import Clock
 from rclpy.qos import QoSProfile
@@ -43,6 +45,7 @@ LIN_VEL_STEP_SIZE = 0.01
 ANG_VEL_STEP_SIZE = 0.01
 
 TURTLEBOT3_MODEL = os.environ.get('TURTLEBOT3_MODEL', 'waffle')
+ROS_DISTRO = os.environ.get('ROS_DISTRO')
 
 msg = """
 Control Your TurtleBot3!
@@ -73,6 +76,7 @@ APF_CONFIG = {
 }
 
 def get_key(settings):
+    
     if os.name == 'nt': #definisce quale sistema operativo sta usando  
         return msvcrt.getch().decode('utf-8')
     tty.setraw(sys.stdin.fileno())
@@ -87,12 +91,14 @@ def get_key(settings):
 
 
 def print_vels(target_linear_velocity, target_angular_velocity):
+    
     print('currently:\tlinear velocity {0}\t angular velocity {1} '.format(
         target_linear_velocity,
         target_angular_velocity))
 
 #introduce una rampa per aumentare la vel in maniera incrementale
 def make_simple_profile(output_vel, input_vel, slop):
+    
     if input_vel > output_vel:
         output_vel = min(input_vel, output_vel + slop)
     elif input_vel < output_vel:
@@ -105,6 +111,7 @@ def make_simple_profile(output_vel, input_vel, slop):
 
 # make_simple_profile serve a saturare l'uscita nel caso in cui chiediamo un input troppo alto 
 def constrain(input_vel, low_bound, high_bound):
+    
     if input_vel < low_bound:
         input_vel = low_bound
     elif input_vel > high_bound:
@@ -116,6 +123,7 @@ def constrain(input_vel, low_bound, high_bound):
 
 
 def check_linear_limit_velocity(velocity):
+    
     if TURTLEBOT3_MODEL == 'burger':
         return constrain(velocity, -BURGER_MAX_LIN_VEL, BURGER_MAX_LIN_VEL)
     else:
@@ -123,13 +131,15 @@ def check_linear_limit_velocity(velocity):
 
 
 def check_angular_limit_velocity(velocity):
+    
     if TURTLEBOT3_MODEL == 'burger':
         return constrain(velocity, -BURGER_MAX_ANG_VEL, BURGER_MAX_ANG_VEL)
     else:
         return constrain(velocity, -WAFFLE_MAX_ANG_VEL, WAFFLE_MAX_ANG_VEL)
     
-def update_velocity(pub,ROS_DISTRO,lin_velocity, ang_velocity):
-    if ROS_DISTRO == 'humble':
+def update_velocity(pub,ros_distro,lin_velocity, ang_velocity):
+    
+    if ros_distro == 'humble':
         twist = Twist()
         twist.linear.x = lin_velocity
         twist.linear.y = 0.0
@@ -151,15 +161,21 @@ def update_velocity(pub,ROS_DISTRO,lin_velocity, ang_velocity):
         twist_stamped.twist.angular.x = 0.0
         twist_stamped.twist.angular.y = 0.0
         twist_stamped.twist.angular.z = ang_velocity
-        pub.publish(twist)
+        pub.publish(twist_stamped)
 
 
 class PerceptionNode(Node):
 
     def __init__(self):
         
-        super().__init__('perception_node')
-        self.object_pub = PointStamped ()
+        super().__init__(
+            'perception_node',
+            parameter_overrides=[
+                rclpy.parameter.Parameter('use_sim_time', rclpy.Parameter.Type.BOOL, True)
+            ]    
+        )
+
+        self.tf_buffer = Buffer()
         self.cb_group = ReentrantCallbackGroup()
         self.pub = self.create_publisher(PointCloud2, '/filtered_pc', 10)
         self.sub = self.create_subscription(
@@ -172,24 +188,29 @@ class PerceptionNode(Node):
         
         
     def perception_callback(self, msg):
-        
-        objects = self.get_obstacle_positions(msg)
-        self.object_pub.point.x = objects[0]
-        self.object_pub.point.y = objects[1]
-        self.object_pub.point.z = objects[2]
-        self.pub.publish(self.object_pub)
+
+        points = self.get_obstacle_positions(msg)
+
+        if not points:
+            return
+
+        cloud_msg = point_cloud2.create_cloud_xyz32(
+            header=msg.header,
+            points=points
+        )
+
+        self.pub.publish(cloud_msg)
         
         
     def get_obstacle_positions(self, msg):
         
-        obstacles = []
         objects_detected = []
         x_offset = 0
         y_offset = 4
         z_offset = 8
         
         #now = self.node.get_clock().now()
-        msg_time = Time.from_msg(msg.header.stamp)
+        #msg_time = Time.from_msg(msg.header.stamp)
         
         # Verifica che il TF sia disponibile PRIMA di processare i punti
         try:
@@ -198,16 +219,17 @@ class PerceptionNode(Node):
                 'zed_camera_link',    # target frame
                 msg.header.frame_id,  # source
                 msg.header.stamp,
-                timeout=rclpy.duration.Duration(seconds=0.2)
+                timeout=rclpy.duration.Duration(seconds=0.5)
             )
             
             
         except Exception as e:
-            self.node.get_logger().warn(f"TF non disponibile: {e}")
+            self.get_logger().warn(f"TF non disponibile: {e}")
             return []  # Ritorna lista vuota se non c'è TF
         
         # Ora processa i punti
         for i in range(0, len(msg.data), msg.point_step):
+            
             point_data = msg.data[i:i + msg.point_step]
             
             x = struct.unpack('f', point_data[x_offset:x_offset+4])[0] 
@@ -230,23 +252,19 @@ class PerceptionNode(Node):
             try:
                 p_chassis = tf2_geometry_msgs.do_transform_point(p, transform)
                 
-                x_robot = p_chassis.point.x
-                y_robot = p_chassis.point.y
-                z_robot = p_chassis.point.z
-                
                 # Filtra punti validi
-                if (0.1 < x_robot <= 1.0 and
-                    abs(y_robot) < 3.0 and
-                    -0.5 < z_robot < 2.5):
+                if (0.1 < p_chassis.point.x <= 1.0 and
+                    abs(p_chassis.point.y) < 3.0 and
+                    -0.5 < p_chassis.point.z < 2.5):
                     
                     #print(f"Trasformato: camera[{x:.2f},{y:.2f},{z:.2f}] -> chassis[{x_robot:.2f},{y_robot:.2f},{z_robot:.2f}]")
-                    objects_detected.append([x_robot, y_robot, z_robot])
+                    objects_detected.append([p_chassis.point.x, p_chassis.point.y, p_chassis.point.z])
                     
             except Exception as e:
-                self.node.get_logger().error(f"Errore trasformazione punto: {e}")
+                self.get_logger().error(f"Errore trasformazione punto: {e}")
                 continue  
             
-        return [x_robot, y_robot, z_robot]  
+        return objects_detected  
             
 #L'OBIETTIVO E' FARE UN CLAUSTER AL FINE DI RICONOSCERE GLI OSTACOLI COSÌ DA FARE IL CONTROLLO RISPETTO AD UN 
 # OSTACOLO PIUTTOSTO CHE DA CIASCUN PUNTO
@@ -255,6 +273,15 @@ class DBSCANNode(Node):
     
     def __init__(self):
         
+        super().__init__(
+            'dbscannode',
+            parameter_overrides=[
+                rclpy.parameter.Parameter('use_sim_time', rclpy.Parameter.Type.BOOL, True)
+            ]    
+        )
+
+        self.eps = 0.5
+        self.min_points = 3
         self.cb_group = ReentrantCallbackGroup()
         self.pub = self.create_publisher(PointStamped, '/obstacles', 10)
         self.sub = self.create_subscription(
@@ -265,44 +292,36 @@ class DBSCANNode(Node):
             callback_group=self.cb_group
         )
         
-    def cluster_obstacles(self, pointcloud_data):
+    def cluster_obstacles(self, valid_points_3d):
         
-        if not pointcloud_data:
-            return []
+        if not valid_points_3d:
+            return []        
+            
+        # 2. Applica DBSCAN
+        dbscan_instance = dbscan(valid_points_3d, self.eps, self.min_points)
         
-        valid_points_3d = []
-        for points in pointcloud_data:
-            valid_points_3d.append(points)        
+        # Misura il tempo di esecuzione
+        time_execution, _ = timedcall(dbscan_instance.process)
+        
+        # 3. Estrai i cluster
+        cluster_points = dbscan_instance.get_clusters()
+        
+        print(f"DBSCAN trovato {len(cluster_points)} ostacoli in {time_execution:.3f}s")
+        
+        # 4. Converti i cluster in ostacoli 3D
+        obstacles_3d = []
+                            
+        # Calcola il centroide dell'ostacolo
+        for cluster in cluster_points:
             
-            if len(valid_points_3d) < self.min_points:
-                return []
-            
-            # 2. Applica DBSCAN
-            dbscan_instance = dbscan(valid_points_3d, self.eps, self.min_points)
-            
-            # Misura il tempo di esecuzione
-            time_execution, _ = timedcall(dbscan_instance.process)
-            
-            # 3. Estrai i cluster
-            clusters = dbscan_instance.get_clusters()
-            
-            print(f"DBSCAN trovato {len(clusters)} ostacoli in {time_execution:.3f}s")
-            
-            # 4. Converti i cluster in ostacoli 3D
-            obstacles_3d = []
-            
-            for cluster_indices in clusters:
-                cluster_points = []
-                        
-                # Calcola il centroide dell'ostacolo
-                if cluster_points:
-                    centroid = self.calculate_centroid(cluster_points)
-                    obstacles_3d.append({
-                        'centroid': centroid,  # [x, y, z] del centro
-                        'points': cluster_points,  # Tutti i punti del cluster
-                        'size': len(cluster_points),
-                        'distance': math.sqrt(centroid[0]**2 + centroid[1]**2 + centroid[2]**2)
-                    })
+            valid_cluster = valid_points_3d [cluster]
+            centroid = self.calculate_centroid(valid_cluster)
+            obstacles_3d.append({
+                'centroid': centroid,  # [x, y, z] del centro
+                'points': valid_cluster,  # Tutti i punti del cluster
+                'size': len(valid_cluster),
+                'distance': math.sqrt(centroid[0]**2 + centroid[1]**2 + centroid[2]**2)
+            })
             
         return obstacles_3d
     
@@ -332,64 +351,89 @@ class DBSCANNode(Node):
 
     def dbscan_callback(self, msg):
         
-        obstacles = self.cluster_obstacles(msg)
+        points = [
+            [float(p[0]), float(p[1]), float(p[2])] 
+            for p in point_cloud2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True)
+        ]
+        downsampled_points = [list(p) for p in points[::10]] #sottocampionamento
+        
+        if not points:
+            return
+        obstacles = self.cluster_obstacles(downsampled_points)
 
         for o in obstacles:
             p = PointStamped()
-            p.point.x, p.point.y, p.point.z = o
+            p.header = msg.header
+            p.point.x, p.point.y, p.point.z = o['centroid']
             self.pub.publish(p)
             
 class TeleopNode(Node):
 
     def __init__(self):
-
-        self.cb_group = MutuallyExclusiveCallbackGroup()
-        self.pub = self.create_publisher(Twist, '/cmd_vel_teleop', 10)
-        self.create_subscription(
-            PointStamped, '/obstacles', self.teleop_callback, 10, callback_group=self.cb_group
+        
+        super().__init__(
+            'teleopnode',
+            parameter_overrides=[
+                rclpy.parameter.Parameter('use_sim_time', rclpy.Parameter.Type.BOOL, True)
+            ]
         )
+
+        self.settings = termios.tcgetattr(sys.stdin) 
+        self.cb_group = ReentrantCallbackGroup()
+        self.pub = self.create_publisher(Twist, '/cmd_vel_teleop', 10)
 
         self.target_lin = 0.0
         self.target_ang = 0.0
         self.ctrl_lin = 0.0
         self.ctrl_ang = 0.0
 
-        self.settings = termios.tcgetattr(sys.stdin)
-        self.timer = self.create_timer(0.05, self.loop, callback_group=self.cb_group)
+        self.timer = self.create_timer(0.05, self.teleop_callback, callback_group=self.cb_group)
 
-
-    def teleop_callback(self,obstacles):
+    def destroy_node(self):
+        if os.name != 'nt':
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.settings)
+        super().destroy_node()
         
-        if len(obstacles) > 0:
-            return
-        else:
-            key = get_key(self.settings)
+    def teleop_callback(self):
+        
+        key = get_key(self.settings)
 
-            if key == 'w':
-                self.target_lin = check_linear_limit_velocity(self.target_lin + LIN_VEL_STEP_SIZE)
-            elif key == 'x':
-                self.target_lin = check_linear_limit_velocity(self.target_lin - LIN_VEL_STEP_SIZE)
-            elif key == 'a':
-                self.target_ang = check_angular_limit_velocity(self.target_ang + ANG_VEL_STEP_SIZE)
-            elif key == 'd':
-                self.target_ang = check_angular_limit_velocity(self.target_ang - ANG_VEL_STEP_SIZE)
-            elif key == ' ':
-                self.target_lin = self.target_ang = 0.0
+        if key == 'w':
+            self.target_lin = check_linear_limit_velocity(self.target_lin + LIN_VEL_STEP_SIZE)
+        elif key == 'x':
+            self.target_lin = check_linear_limit_velocity(self.target_lin - LIN_VEL_STEP_SIZE)
+        elif key == 'a':
+            self.target_ang = check_angular_limit_velocity(self.target_ang + ANG_VEL_STEP_SIZE)
+        elif key == 'd':
+            self.target_ang = check_angular_limit_velocity(self.target_ang - ANG_VEL_STEP_SIZE)
+        elif key == ' ' or key == 's':
+            self.target_lin = self.target_ang = 0.0
+        # else:
+        #     if (key == '\x03'):
+        #         break
 
-            self.ctrl_lin = make_simple_profile(self.ctrl_lin, self.target_lin, LIN_VEL_STEP_SIZE / 2)
-            self.ctrl_ang = make_simple_profile(self.ctrl_ang, self.target_ang, ANG_VEL_STEP_SIZE / 2)
+        self.ctrl_lin = make_simple_profile(self.ctrl_lin, self.target_lin, LIN_VEL_STEP_SIZE / 2)
+        self.ctrl_ang = make_simple_profile(self.ctrl_ang, self.target_ang, ANG_VEL_STEP_SIZE / 2)
 
-            update_velocity(pub,ROS_DISTRO,self.ctrl_lin, self.ctrl_ang)
-            
+        update_velocity(self.pub,ROS_DISTRO,self.ctrl_lin, self.ctrl_ang)
+    
             
 class APFNode(Node):
     
     def __init__(self):
-        
-        self.teleop_vel = 0
+        super().__init__(
+            'apfnode',
+            parameter_overrides=[
+                rclpy.parameter.Parameter('use_sim_time', rclpy.Parameter.Type.BOOL, True)
+            ]
+        )
+        self.config = APF_CONFIG
+        self.teleop_lin_vel = 0.0
+        self.teleop_ang_vel = 0.0
+        self.ctrl_lin = 0.0
         self.obstacle = []
-        self.cb_group = MutuallyExclusiveCallbackGroup()
-        self.pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.cb_group = ReentrantCallbackGroup()
+        self.pub = self.create_publisher(Twist, '/cmd_vel_apf', 10)
         self.create_subscription(
             PointStamped, '/obstacles', self.apf_callback, 10, callback_group=self.cb_group
         )
@@ -425,47 +469,113 @@ class APFNode(Node):
          
         return [ new_lin_vel, total_force, angle ]
     
-    def apfTeleop_callback(self, TeleoperationVel):
+    def apfTeleop_callback(self, msg):
         
-        self.teleop_vel = TeleoperationVel
+        self.teleop_lin_vel = msg.linear.x 
+        self.teleop_ang_vel = msg.angular.z
     
-    def apf_callback(self,obstacles):
-        
-        for o in obstacles:
+    def apf_callback(self,msg):
             
-            self.obstacle = o
-            distance_x = o[0]
-            distance_y = o[1]
-            distance_z = o[2]
+        distance_x = msg.point.x
+        distance_y = msg.point.y
+        self.obstacle = [distance_x, distance_y]
         
-        if len(obstacles < 1):
-            
-            self.pub.publish(self.teleop_vel)
+        [apf_lin_vel, apf_ang_vel, angle] = self.compute_total_force( self.teleop_lin_vel, self.obstacle)
+        self.ctrl_lin = make_simple_profile(apf_lin_vel, self.teleop_lin_vel, LIN_VEL_STEP_SIZE / 2)
+        self.ctrl_ang = make_simple_profile(apf_ang_vel, self.teleop_ang_vel, ANG_VEL_STEP_SIZE / 2)
+
+        update_velocity(self.pub,ROS_DISTRO,self.ctrl_lin, self.ctrl_ang)
+        
+class VelocityMuxNode(Node):
+    
+    def __init__(self):
+        
+        super().__init__('velocitymuxnode')
+        self.LinearTeleop = 0.0
+        self.AngularTeleop = 0.0
+        self.LinearApf = 0.0
+        self.AngularApf = 0.0
+        self.obstacleDetected = False
+        self.last_obstacle_time = self.get_clock().now()
+        self.obstacle_timeout = 0.5 
+        self.cb_group = ReentrantCallbackGroup()
+        self.pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.create_subscription(
+            PointStamped, '/obstacles', self.mux_callback, 10, callback_group=self.cb_group
+        )
+        self.create_subscription(
+            Twist, '/cmd_vel_teleop', self.mux_teleop_callback, 10, callback_group=self.cb_group
+        )
+        self.create_subscription(
+            Twist, '/cmd_vel_apf', self.mux_apf_callback, 10, callback_group=self.cb_group
+        )
+        
+        self.create_timer(0.1, self.vel_publish)
+        
+    def vel_publish(self):
+
+        now = self.get_clock().now()
+        time_diff = (now - self.last_obstacle_time).nanoseconds / 1e9
+        
+        twist = Twist()
+        
+        if time_diff < self.obstacle_timeout:
+            twist.linear.x = self.LinearApf
+            twist.angular.z = self.AngularApf
         else:
+            twist.linear.x = self.LinearTeleop
+            twist.angular.z = self.AngularTeleop
             
-            [apf_lin_vel, apf_ang_vel, angle] = compute_total_force(self, self.teleop_vel, self.obstacle)
-            self.ctrl_lin = make_simple_profile(self.ctrl_lin, apf_lin_vel, LIN_VEL_STEP_SIZE / 2)
-            self.ctrl_ang = make_simple_profile(self.ctrl_ang, apf_ang_vel, ANG_VEL_STEP_SIZE / 2)
+        self.pub.publish(twist)
+        
+    def mux_callback (self,msg):
+            
+        self.last_obstacle_time = self.get_clock().now()
+            
+    def mux_teleop_callback (self,msg):
+        
+        self.LinearTeleop = msg.linear.x
+        self.AngularTeleop = msg.angular.z
+            
+    def mux_apf_callback (self,msg):
+        
+        self.LinearApf = msg.linear.x
+        self.AngularApf = msg.angular.z
+            
+def main(args=None):
+    
+    rclpy.init(args=args)
 
-            update_velocity(self.pub,ROS_DISTRO,self.ctrl_lin, self.ctrl_ang)
-            
-            
-def main():
-    rclpy.init()
-
-    executor = MultiThreadedExecutor(num_threads=4)
+    executor = MultiThreadedExecutor(num_threads=5)
+    
+    p_node = PerceptionNode ()
+    p_node.tf_buffer = Buffer()
+    p_node.tf_listener = TransformListener(p_node.tf_buffer, p_node)
 
     nodes = [
-        PerceptionNode(),
+        p_node,
         DBSCANNode(),
         TeleopNode(),
-        APFNode()
+        APFNode(),
+        VelocityMuxNode()
     ]
 
     for n in nodes:
         executor.add_node(n)
 
-    executor.spin()
+    try:
+        print(msg) 
+        executor.spin()
+        
+    except KeyboardInterrupt:
+        pass
+    
+    finally:
+        executor.shutdown()
+        for n in nodes:
+            executor.remove_node(n)
+            n.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':
