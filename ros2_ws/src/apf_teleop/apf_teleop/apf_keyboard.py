@@ -190,15 +190,12 @@ class PerceptionNode(Node):
     def perception_callback(self, msg):
 
         points = self.get_obstacle_positions(msg)
-
         if not points:
             return
-
         cloud_msg = point_cloud2.create_cloud_xyz32(
             header=msg.header,
             points=points
         )
-
         self.pub.publish(cloud_msg)
         
         
@@ -231,14 +228,13 @@ class PerceptionNode(Node):
         for i in range(0, len(msg.data), msg.point_step):
             
             point_data = msg.data[i:i + msg.point_step]
-            
             x = struct.unpack('f', point_data[x_offset:x_offset+4])[0] 
             y = struct.unpack('f', point_data[y_offset:y_offset+4])[0]  
             z = struct.unpack('f', point_data[z_offset:z_offset+4])[0]
-
-            
             if not math.isfinite(x) or not math.isfinite(y) or not math.isfinite(z):
                 continue
+            
+            #x,y = y,x
 
             # Crea il punto nel frame della camera
             p = PointStamped()
@@ -251,11 +247,16 @@ class PerceptionNode(Node):
             # Trasforma nel frame del robot (usa il transform già ottenuto)
             try:
                 p_chassis = tf2_geometry_msgs.do_transform_point(p, transform)
-                
+
                 # Filtra punti validi
                 if (0.1 < p_chassis.point.x <= 1.0 and
                     abs(p_chassis.point.y) < 3.0 and
                     -0.5 < p_chassis.point.z < 2.5):
+                    
+                    self.get_logger().info(
+                        f"Punto Trasformato -> X: {p_chassis.point.x:.2f}, Y: {p_chassis.point.y:.2f}",
+                        throttle_duration_sec=1.0 # Stampa ogni secondo per non intasare
+                    )
                     
                     #print(f"Trasformato: camera[{x:.2f},{y:.2f},{z:.2f}] -> chassis[{x_robot:.2f},{y_robot:.2f},{z_robot:.2f}]")
                     objects_detected.append([p_chassis.point.x, p_chassis.point.y, p_chassis.point.z])
@@ -312,9 +313,9 @@ class DBSCANNode(Node):
         obstacles_3d = []
                             
         # Calcola il centroide dell'ostacolo
-        for cluster in cluster_points:
+        for indices in cluster_points:
             
-            valid_cluster = valid_points_3d [cluster]
+            valid_cluster = [valid_points_3d[i] for i in indices]
             centroid = self.calculate_centroid(valid_cluster)
             obstacles_3d.append({
                 'centroid': centroid,  # [x, y, z] del centro
@@ -328,12 +329,10 @@ class DBSCANNode(Node):
     def calculate_centroid(self, points):
 
         if not points:
-            return None
-        
+            return None       
         sum_x = sum(p[0] for p in points)
         sum_y = sum(p[1] for p in points) 
         sum_z = sum(p[2] for p in points)
-        
         n = len(points)
         return [sum_x/n, sum_y/n, sum_z/n]
     
@@ -414,7 +413,7 @@ class TeleopNode(Node):
 
         self.ctrl_lin = make_simple_profile(self.ctrl_lin, self.target_lin, LIN_VEL_STEP_SIZE / 2)
         self.ctrl_ang = make_simple_profile(self.ctrl_ang, self.target_ang, ANG_VEL_STEP_SIZE / 2)
-
+        print_vels(self.target_lin, self.target_ang)
         update_velocity(self.pub,ROS_DISTRO,self.ctrl_lin, self.ctrl_ang)
     
             
@@ -431,6 +430,7 @@ class APFNode(Node):
         self.teleop_lin_vel = 0.0
         self.teleop_ang_vel = 0.0
         self.ctrl_lin = 0.0
+        self.ctrl_ang = 0.0
         self.obstacle = []
         self.cb_group = ReentrantCallbackGroup()
         self.pub = self.create_publisher(Twist, '/cmd_vel_apf', 10)
@@ -461,6 +461,10 @@ class APFNode(Node):
 
     def compute_total_force(self, control_linear_velocity, distance):
         
+        if len(distance) < 3:
+            self.get_logger().error("Dati ostacolo incompleti (possibile buffer overflow in Sim)")
+            return [0.0, 0.0, 0.0]
+        
         angle = np.atan2 (distance[1] , distance[0])
         print(f"[OSTACOLO] x={distance[0]:.2f}, y={distance[1]:.2f}, z={distance[2]:.2f}, angle={np.degrees(angle):.1f}°")
         [ new_lin_vel, attractive_force ] = self.compute_attractive_forces (control_linear_velocity, angle)
@@ -476,15 +480,13 @@ class APFNode(Node):
     
     def apf_callback(self,msg):
             
-        distance_x = msg.point.x
-        distance_y = msg.point.y
-        self.obstacle = [distance_x, distance_y]
-        
+        self.obstacle = [msg.point.x, msg.point.y, msg.point.z]
         [apf_lin_vel, apf_ang_vel, angle] = self.compute_total_force( self.teleop_lin_vel, self.obstacle)
-        self.ctrl_lin = make_simple_profile(apf_lin_vel, self.teleop_lin_vel, LIN_VEL_STEP_SIZE / 2)
-        self.ctrl_ang = make_simple_profile(apf_ang_vel, self.teleop_ang_vel, ANG_VEL_STEP_SIZE / 2)
-
-        update_velocity(self.pub,ROS_DISTRO,self.ctrl_lin, self.ctrl_ang)
+        apf_lin_vel = apf_lin_vel * self.config['LIN_VELOCITY_GAIN']
+        apf_ang_vel = apf_ang_vel * self.config['ANG_VELOCITY_GAIN']
+        #self.ctrl_lin = make_simple_profile(apf_lin_vel, self.teleop_lin_vel, LIN_VEL_STEP_SIZE / 2)
+        #self.ctrl_ang = make_simple_profile(apf_ang_vel, self.teleop_ang_vel, ANG_VEL_STEP_SIZE / 2)
+        update_velocity(self.pub,ROS_DISTRO,apf_lin_vel, apf_ang_vel)
         
 class VelocityMuxNode(Node):
     
@@ -522,7 +524,9 @@ class VelocityMuxNode(Node):
         if time_diff < self.obstacle_timeout:
             twist.linear.x = self.LinearApf
             twist.angular.z = self.AngularApf
+            #self.get_logger().info("Stato: APF Attivo")
         else:
+            #self.get_logger().info("Stato: Teleop Attivo")
             twist.linear.x = self.LinearTeleop
             twist.angular.z = self.AngularTeleop
             
@@ -564,7 +568,6 @@ def main(args=None):
         executor.add_node(n)
 
     try:
-        print(msg) 
         executor.spin()
         
     except KeyboardInterrupt:
@@ -575,7 +578,10 @@ def main(args=None):
         for n in nodes:
             executor.remove_node(n)
             n.destroy_node()
-        rclpy.shutdown()
+        #rclpy.shutdown()
+        #executor.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':
