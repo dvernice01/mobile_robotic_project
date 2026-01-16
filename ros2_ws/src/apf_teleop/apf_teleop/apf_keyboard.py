@@ -175,7 +175,7 @@ class PerceptionNode(Node):
             ]    
         )
 
-        self.tf_buffer = Buffer()
+        self.tf_buffer = Buffer(cache_time=Duration(seconds=10.0))
         self.cb_group = ReentrantCallbackGroup()
         self.pub = self.create_publisher(PointCloud2, '/filtered_pc', 10)
         self.sub = self.create_subscription(
@@ -185,6 +185,44 @@ class PerceptionNode(Node):
             10,
             callback_group=self.cb_group
         )
+    
+        # self.create_timer(3.0, self.debug_tf)
+        
+        # Contatore per warning
+        # self.tf_warning_count = 0
+        
+    # def debug_tf(self):
+    #     """Verifica stato TF ogni 3 secondi"""
+    #     frames_to_check = [
+    #         ('map', 'odom'),
+    #         ('odom', 'chassis_link'),
+    #         ('chassis_link', 'zed_camera_link'),
+    #         ('zed_camera_link', 'zed_left_camera_frame')
+    #     ]
+        
+    #     self.get_logger().info("=== TF STATUS ===")
+    #     all_ok = True
+        
+    #     for parent, child in frames_to_check:
+    #         try:
+    #             if self.tf_buffer.can_transform(
+    #                 parent, child, 
+    #                 Time(),  # Time(0) = ultimo TF disponibile
+    #                 timeout=Duration(seconds=0.5)
+    #             ):
+    #                 self.get_logger().info(f"✓ {parent} → {child}")
+    #             else:
+    #                 self.get_logger().warn(f"✗ {parent} → {child} MISSING")
+    #                 all_ok = False
+    #         except Exception as e:
+    #             self.get_logger().error(f"✗ {parent} → {child} ERROR: {e}")
+    #             all_ok = False
+        
+    #     if all_ok:
+    #         self.get_logger().info("✓✓✓ Tutti i TF sono disponibili!")
+    #     else:
+    #         self.get_logger().warn("⚠ Alcuni TF non sono disponibili - controlla Isaac Sim")
+        
         
         
     def perception_callback(self, msg):
@@ -196,6 +234,12 @@ class PerceptionNode(Node):
             header=msg.header,
             points=points
         )
+        # self.get_logger().info(
+        #                 f"punti percezione x : {points[0]:.2f}, Y: {points[1]:.2f}, z: {points[2]:.2f}",
+        #                 throttle_duration_sec=1.0 
+        #             )
+        
+        
         self.pub.publish(cloud_msg)
         
         
@@ -206,6 +250,22 @@ class PerceptionNode(Node):
         y_offset = 4
         z_offset = 8
         
+        
+        # if not self.tf_buffer.can_transform(
+        #     'zed_camera_link',
+        #     msg.header.frame_id,
+        #     Time(),  # Ultimo TF disponibile
+        #     timeout=Duration(seconds=0.1)
+        # ):
+            # Non stampare warning ogni volta, solo ogni 100 volte
+            # self.tf_warning_count += 1
+            # if self.tf_warning_count % 100 == 0:
+            #     self.get_logger().warn(
+            #         f"TF non disponibile: {msg.header.frame_id} -> zed_camera_link "
+            #         f"(warning #{self.tf_warning_count})"
+            #     )
+            # return []
+        
         #now = self.node.get_clock().now()
         #msg_time = Time.from_msg(msg.header.stamp)
         
@@ -215,14 +275,23 @@ class PerceptionNode(Node):
             transform = self.tf_buffer.lookup_transform(
                 'zed_camera_link',    # target frame
                 msg.header.frame_id,  # source
-                msg.header.stamp,
-                timeout=rclpy.duration.Duration(seconds=0.5)
+                Time(),
+                #msg.header.stamp,
+                timeout=rclpy.duration.Duration(seconds=1.0)
             )
             
             
         except Exception as e:
-            self.get_logger().warn(f"TF non disponibile: {e}")
-            return []  # Ritorna lista vuota se non c'è TF
+            self.tf_warning_count += 1
+            if self.tf_warning_count % 100 == 0:
+                self.get_logger().warn(f"TF lookup failed: {e} (warning #{self.tf_warning_count})")
+            return []
+        
+        # # Reset counter quando funziona
+        # if self.tf_warning_count > 0:
+        #     self.get_logger().info(f"TF ripristinato dopo {self.tf_warning_count} warning")
+        #     self.tf_warning_count = 0
+        
         
         # Ora processa i punti
         for i in range(0, len(msg.data), msg.point_step):
@@ -249,17 +318,20 @@ class PerceptionNode(Node):
                 p_chassis = tf2_geometry_msgs.do_transform_point(p, transform)
 
                 # Filtra punti validi
-                if (0.1 < p_chassis.point.x <= 1.0 and
-                    abs(p_chassis.point.y) < 3.0 and
-                    -0.5 < p_chassis.point.z < 2.5):
+                if p_chassis.point.z < 0.1:
+                    continue
+                else:
+                    objects_detected.append([p_chassis.point.x, p_chassis.point.y, p_chassis.point.z])
+                #     abs(p_chassis.point.y) < 3.0 and
+                #     -0.5 < p_chassis.point.z < 2.5):
                     
-                    self.get_logger().info(
-                        f"Punto Trasformato -> X: {p_chassis.point.x:.2f}, Y: {p_chassis.point.y:.2f}",
-                        throttle_duration_sec=1.0 # Stampa ogni secondo per non intasare
-                    )
+                    # self.get_logger().info(
+                    #     f"Punto Trasformato -> X: {p_chassis.point.x:.2f}, Y: {p_chassis.point.y:.2f}",
+                    #     throttle_duration_sec=1.0 # Stampa ogni secondo per non intasare
+                    # )
                     
                     #print(f"Trasformato: camera[{x:.2f},{y:.2f},{z:.2f}] -> chassis[{x_robot:.2f},{y_robot:.2f},{z_robot:.2f}]")
-                    objects_detected.append([p_chassis.point.x, p_chassis.point.y, p_chassis.point.z])
+                
                     
             except Exception as e:
                 self.get_logger().error(f"Errore trasformazione punto: {e}")
@@ -281,8 +353,8 @@ class DBSCANNode(Node):
             ]    
         )
 
-        self.eps = 0.5
-        self.min_points = 3
+        self.eps = 0.3
+        self.min_points = 15
         self.cb_group = ReentrantCallbackGroup()
         self.pub = self.create_publisher(PointStamped, '/obstacles', 10)
         self.sub = self.create_subscription(
@@ -311,6 +383,7 @@ class DBSCANNode(Node):
         
         # 4. Converti i cluster in ostacoli 3D
         obstacles_3d = []
+        valid_obstacle = []
                             
         # Calcola il centroide dell'ostacolo
         for indices in cluster_points:
@@ -321,10 +394,16 @@ class DBSCANNode(Node):
                 'centroid': centroid,  # [x, y, z] del centro
                 'points': valid_cluster,  # Tutti i punti del cluster
                 'size': len(valid_cluster),
-                'distance': math.sqrt(centroid[0]**2 + centroid[1]**2 + centroid[2]**2)
+                'distance': math.sqrt(centroid[0]**2 + centroid[1]**2)
             })
             
-        return obstacles_3d
+        for o in obstacles_3d:
+            # x, y, z = o['centroid']
+
+            # if 0 < x < 2.0 and abs(y) < 3.0 and z > 0:
+            valid_obstacle.append(o['centroid'])
+            
+        return valid_obstacle
     
     def calculate_centroid(self, points):
 
@@ -332,9 +411,9 @@ class DBSCANNode(Node):
             return None       
         sum_x = sum(p[0] for p in points)
         sum_y = sum(p[1] for p in points) 
-        sum_z = sum(p[2] for p in points)
+        #sum_z = sum(p[2] for p in points)
         n = len(points)
-        return [sum_x/n, sum_y/n, sum_z/n]
+        return [sum_x/n, sum_y/n]
     
     def get_largest_obstacle(self, obstacles):
         """Restituisce l'ostacolo più grande (più punti)"""
@@ -351,7 +430,7 @@ class DBSCANNode(Node):
     def dbscan_callback(self, msg):
         
         points = [
-            [float(p[0]), float(p[1]), float(p[2])] 
+            [float(p[0]), float(p[1])] 
             for p in point_cloud2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True)
         ]
         downsampled_points = [list(p) for p in points[::10]] #sottocampionamento
@@ -363,7 +442,9 @@ class DBSCANNode(Node):
         for o in obstacles:
             p = PointStamped()
             p.header = msg.header
-            p.point.x, p.point.y, p.point.z = o['centroid']
+            p.point.x = o[0]
+            p.point.y = o[1]
+            #p.point.z = o[2]
             self.pub.publish(p)
             
 class TeleopNode(Node):
@@ -399,12 +480,16 @@ class TeleopNode(Node):
 
         if key == 'w':
             self.target_lin = check_linear_limit_velocity(self.target_lin + LIN_VEL_STEP_SIZE)
+            print_vels(self.target_lin, self.target_ang)
         elif key == 'x':
             self.target_lin = check_linear_limit_velocity(self.target_lin - LIN_VEL_STEP_SIZE)
+            print_vels(self.target_lin, self.target_ang)
         elif key == 'a':
             self.target_ang = check_angular_limit_velocity(self.target_ang + ANG_VEL_STEP_SIZE)
+            print_vels(self.target_lin, self.target_ang)
         elif key == 'd':
             self.target_ang = check_angular_limit_velocity(self.target_ang - ANG_VEL_STEP_SIZE)
+            print_vels(self.target_lin, self.target_ang)
         elif key == ' ' or key == 's':
             self.target_lin = self.target_ang = 0.0
         # else:
@@ -413,7 +498,7 @@ class TeleopNode(Node):
 
         self.ctrl_lin = make_simple_profile(self.ctrl_lin, self.target_lin, LIN_VEL_STEP_SIZE / 2)
         self.ctrl_ang = make_simple_profile(self.ctrl_ang, self.target_ang, ANG_VEL_STEP_SIZE / 2)
-        print_vels(self.target_lin, self.target_ang)
+        #print_vels(self.target_lin, self.target_ang)
         update_velocity(self.pub,ROS_DISTRO,self.ctrl_lin, self.ctrl_ang)
     
             
