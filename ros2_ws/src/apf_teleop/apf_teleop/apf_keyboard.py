@@ -14,6 +14,7 @@ else:
     import tty
 
 from geometry_msgs.msg import Twist, TwistStamped, PointStamped
+from std_msgs.msg import Bool
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs.msg import PointField
 from sensor_msgs_py import point_cloud2
@@ -32,7 +33,7 @@ from rclpy.callback_groups import (
 from pyclustering.cluster.dbscan import dbscan
 from pyclustering.utils import timedcall
 
-from tf2_ros import Buffer, TransformListener
+from tf2_ros import Buffer, TransformListener, ExtrapolationException
 
 
 BURGER_MAX_LIN_VEL = 2.22
@@ -270,30 +271,47 @@ class PerceptionNode(Node):
         #msg_time = Time.from_msg(msg.header.stamp)
         
         # Verifica che il TF sia disponibile PRIMA di processare i punti
-        try:
-            # Cerca la trasformazione con timeout più lungo
-            transform = self.tf_buffer.lookup_transform(
-                'zed_camera_link',    # target frame
-                msg.header.frame_id,  # source
-                Time(),
-                #msg.header.stamp,
-                timeout=rclpy.duration.Duration(seconds=1.0)
-            )
-            
-            
-        except Exception as e:
-            self.tf_warning_count += 1
-            if self.tf_warning_count % 100 == 0:
-                self.get_logger().warn(f"TF lookup failed: {e} (warning #{self.tf_warning_count})")
-            return []
+        #try:
+        # Cerca la trasformazione con timeout più lungo
         
-        # # Reset counter quando funziona
-        # if self.tf_warning_count > 0:
-        #     self.get_logger().info(f"TF ripristinato dopo {self.tf_warning_count} warning")
-        #     self.tf_warning_count = 0
+        transform = self.tf_buffer.lookup_transform(
+            'chassis_link',    # target frame
+            msg.header.frame_id,  # source
+            Time.from_msg(msg.header.stamp),
+            #msg.header.stamp,
+            timeout=rclpy.duration.Duration(seconds=0.5)
+        )
+        
+        # try:
+        #     transform = self.tf_buffer.lookup_transform(
+        #         'chassis_link',
+        #         msg.header.frame_id,
+        #         Time.from_msg(msg.header.stamp),
+        #         timeout=Duration(seconds=0.1)
+        #     )
+        # except ExtrapolationException:
+        #     transform = self.tf_buffer.lookup_transform(
+        #         'chassis_link',
+        #         msg.header.frame_id,
+        #         Time(),
+        #         timeout=Duration(seconds=0.1)
+        #     )
+
         
         
-        # Ora processa i punti
+    # except Exception as e:
+    #     self.tf_warning_count += 1
+    #     if self.tf_warning_count % 100 == 0:
+    #         self.get_logger().warn(f"TF lookup failed: {e} (warning #{self.tf_warning_count})")
+    #     return []
+    
+    # # Reset counter quando funziona
+    # if self.tf_warning_count > 0:
+    #     self.get_logger().info(f"TF ripristinato dopo {self.tf_warning_count} warning")
+    #     self.tf_warning_count = 0
+    
+    
+    # Ora processa i punti
         for i in range(0, len(msg.data), msg.point_step):
             
             point_data = msg.data[i:i + msg.point_step]
@@ -302,7 +320,8 @@ class PerceptionNode(Node):
             z = struct.unpack('f', point_data[z_offset:z_offset+4])[0]
             if not math.isfinite(x) or not math.isfinite(y) or not math.isfinite(z):
                 continue
-            
+            if abs(y) > 0.1 or abs(z) > 0.1: # Filtra il rumore centrale
+                self.get_logger().info(f"RAW POINT - X: {x:.2f}, Y: {y:.2f}, Z: {z:.2f}", throttle_duration_sec=0.5)
             #x,y = y,x
 
             # Crea il punto nel frame della camera
@@ -316,8 +335,11 @@ class PerceptionNode(Node):
             # Trasforma nel frame del robot (usa il transform già ottenuto)
             try:
                 p_chassis = tf2_geometry_msgs.do_transform_point(p, transform)
+                
+                # if p_chassis.point.y < 0:
+                #     print(f"Rilevato punto a DESTRA: Y={p_chassis.point.y}")
 
-                # Filtra punti validi
+                #Filtra punti validi
                 if p_chassis.point.z < 0.1:
                     continue
                 else:
@@ -336,7 +358,7 @@ class PerceptionNode(Node):
             except Exception as e:
                 self.get_logger().error(f"Errore trasformazione punto: {e}")
                 continue  
-            
+        
         return objects_detected  
             
 #L'OBIETTIVO E' FARE UN CLAUSTER AL FINE DI RICONOSCERE GLI OSTACOLI COSÌ DA FARE IL CONTROLLO RISPETTO AD UN 
@@ -353,10 +375,11 @@ class DBSCANNode(Node):
             ]    
         )
 
-        self.eps = 0.3
-        self.min_points = 15
+        self.eps = 0.5
+        self.min_points = 5
         self.cb_group = ReentrantCallbackGroup()
-        self.pub = self.create_publisher(PointStamped, '/obstacles', 10)
+        self.pubGeometry = self.create_publisher(PointStamped, '/obstacles', 10)
+        self.pubFlag = self.create_publisher(Bool, '/obstacle_detected',10)
         self.sub = self.create_subscription(
             PointCloud2,
             '/filtered_pc',
@@ -431,13 +454,20 @@ class DBSCANNode(Node):
         
         points = [
             [float(p[0]), float(p[1])] 
-            for p in point_cloud2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True)
+            for p in point_cloud2.read_points(msg, field_names=("x", "y"), skip_nans=True)
         ]
-        downsampled_points = [list(p) for p in points[::10]] #sottocampionamento
-        
+        downsampled_points = [list(p) for p in points[::3]] #sottocampionamento
+        # DEBUG: Conta quanti punti sono a destra (y < 0) e quanti a sinistra (y > 0)
+        destra = len([p for p in points if p[1] < 0])
+        sinistra = len([p for p in points if p[1] > 0])
+        self.get_logger().info(f"Punti ricevuti - Totali: {len(points)}, Sinistra: {sinistra}, Destra: {destra}")
         if not points:
             return
         obstacles = self.cluster_obstacles(downsampled_points)
+        
+        detected = len(obstacles) > 0
+        
+        self.pubFlag.publish(Bool(data=detected))
 
         for o in obstacles:
             p = PointStamped()
@@ -445,7 +475,7 @@ class DBSCANNode(Node):
             p.point.x = o[0]
             p.point.y = o[1]
             #p.point.z = o[2]
-            self.pub.publish(p)
+            self.pubGeometry.publish(p)
             
 class TeleopNode(Node):
 
@@ -587,17 +617,25 @@ class VelocityMuxNode(Node):
         self.obstacle_timeout = 0.5 
         self.cb_group = ReentrantCallbackGroup()
         self.pub = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.create_subscription(
-            PointStamped, '/obstacles', self.mux_callback, 10, callback_group=self.cb_group
-        )
+        # self.create_subscription(
+        #     PointStamped, '/obstacles', self.mux_callback, 10, callback_group=self.cb_group
+        # )
         self.create_subscription(
             Twist, '/cmd_vel_teleop', self.mux_teleop_callback, 10, callback_group=self.cb_group
         )
         self.create_subscription(
             Twist, '/cmd_vel_apf', self.mux_apf_callback, 10, callback_group=self.cb_group
         )
+        self.create_subscription(
+            Bool, '/obstacle_detected', self.obstacle_flag_callback, 10, callback_group=self.cb_group
+        )
         
         self.create_timer(0.1, self.vel_publish)
+        
+    def obstacle_flag_callback(self, msg):
+        
+        self.obstacleDetected = msg.data
+        self.last_obstacle_time = self.get_clock().now()
         
     def vel_publish(self):
 
@@ -606,20 +644,19 @@ class VelocityMuxNode(Node):
         
         twist = Twist()
         
-        if time_diff < self.obstacle_timeout:
+        if self.obstacleDetected and time_diff < 0.5:
             twist.linear.x = self.LinearApf
             twist.angular.z = self.AngularApf
-            #self.get_logger().info("Stato: APF Attivo")
         else:
-            #self.get_logger().info("Stato: Teleop Attivo")
             twist.linear.x = self.LinearTeleop
             twist.angular.z = self.AngularTeleop
+
             
         self.pub.publish(twist)
         
-    def mux_callback (self,msg):
+    # def mux_callback (self,msg):
             
-        self.last_obstacle_time = self.get_clock().now()
+    #     self.last_obstacle_time = self.get_clock().now()
             
     def mux_teleop_callback (self,msg):
         
