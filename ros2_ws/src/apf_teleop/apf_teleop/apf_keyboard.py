@@ -6,6 +6,7 @@ import struct
 import numpy as np
 import rclpy
 import tf2_geometry_msgs 
+#import matplotlib
 
 if os.name == 'nt':
     import msvcrt
@@ -16,11 +17,9 @@ else:
 from geometry_msgs.msg import Twist, TwistStamped, PointStamped
 from std_msgs.msg import Bool
 from sensor_msgs.msg import PointCloud2
-from sensor_msgs.msg import PointField
 from sensor_msgs_py import point_cloud2
 
 from rclpy.clock import Clock
-from rclpy.qos import QoSProfile
 from rclpy.time import Time
 from rclpy.duration import Duration
 from rclpy.node import Node
@@ -33,8 +32,7 @@ from rclpy.callback_groups import (
 from pyclustering.cluster.dbscan import dbscan
 from pyclustering.utils import timedcall
 
-from tf2_ros import Buffer, TransformListener, ExtrapolationException
-
+from tf2_ros import Buffer, TransformListener
 
 BURGER_MAX_LIN_VEL = 2.22
 BURGER_MAX_ANG_VEL = 2.84
@@ -72,13 +70,13 @@ Communications Failed
 APF_CONFIG = {
     'repulsive_gain': 0.1,      # Guadagno forza repulsiva
     'attractive_gain': 5.0,     # Guadagno forza attrattiva  
-    'LIN_VELOCITY_GAIN': 1.0,
-    'ANG_VELOCITY_GAIN': 0.1,
+    'LIN_VELOCITY_GAIN': 1.0,   # Guadagno velocità lineare 
+    'ANG_VELOCITY_GAIN': 0.1,   # Guadagno velocità angolare
 }
 
 def get_key(settings):
     
-    if os.name == 'nt': #definisce quale sistema operativo sta usando  
+    if os.name == 'nt':   
         return msvcrt.getch().decode('utf-8')
     tty.setraw(sys.stdin.fileno())
     rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
@@ -176,7 +174,6 @@ class PerceptionNode(Node):
             ]    
         )
 
-        self.tf_buffer = Buffer(cache_time=Duration(seconds=10.0))
         self.cb_group = ReentrantCallbackGroup()
         self.pub = self.create_publisher(PointCloud2, '/filtered_pc', 10)
         self.sub = self.create_subscription(
@@ -186,181 +183,21 @@ class PerceptionNode(Node):
             10,
             callback_group=self.cb_group
         )
-    
-        # self.create_timer(3.0, self.debug_tf)
-        
-        # Contatore per warning
-        # self.tf_warning_count = 0
-        
-    # def debug_tf(self):
-    #     """Verifica stato TF ogni 3 secondi"""
-    #     frames_to_check = [
-    #         ('map', 'odom'),
-    #         ('odom', 'chassis_link'),
-    #         ('chassis_link', 'zed_camera_link'),
-    #         ('zed_camera_link', 'zed_left_camera_frame')
-    #     ]
-        
-    #     self.get_logger().info("=== TF STATUS ===")
-    #     all_ok = True
-        
-    #     for parent, child in frames_to_check:
-    #         try:
-    #             if self.tf_buffer.can_transform(
-    #                 parent, child, 
-    #                 Time(),  # Time(0) = ultimo TF disponibile
-    #                 timeout=Duration(seconds=0.5)
-    #             ):
-    #                 self.get_logger().info(f"✓ {parent} → {child}")
-    #             else:
-    #                 self.get_logger().warn(f"✗ {parent} → {child} MISSING")
-    #                 all_ok = False
-    #         except Exception as e:
-    #             self.get_logger().error(f"✗ {parent} → {child} ERROR: {e}")
-    #             all_ok = False
-        
-    #     if all_ok:
-    #         self.get_logger().info("✓✓✓ Tutti i TF sono disponibili!")
-    #     else:
-    #         self.get_logger().warn("⚠ Alcuni TF non sono disponibili - controlla Isaac Sim")
-        
-        
-        
     def perception_callback(self, msg):
 
-        points = self.get_obstacle_positions(msg)
-        if not points:
+        raw_points = []
+        # Prendo i punti della PointCloud e li filtro. Nel mio caso filtro solo il pavimento
+        for p_data in point_cloud2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True): 
+            if p_data[2] > 0.1: 
+                raw_points.append([p_data[0], p_data[1], p_data[2]])
+        
+        if not raw_points:
             return
-        cloud_msg = point_cloud2.create_cloud_xyz32(
-            header=msg.header,
-            points=points
-        )
-        # self.get_logger().info(
-        #                 f"punti percezione x : {points[0]:.2f}, Y: {points[1]:.2f}, z: {points[2]:.2f}",
-        #                 throttle_duration_sec=1.0 
-        #             )
-        
-        
+
+        # Pubblico la nuvola filtrata 
+        cloud_msg = point_cloud2.create_cloud_xyz32(msg.header, raw_points)
         self.pub.publish(cloud_msg)
         
-        
-    def get_obstacle_positions(self, msg):
-        
-        objects_detected = []
-        x_offset = 0
-        y_offset = 4
-        z_offset = 8
-        
-        
-        # if not self.tf_buffer.can_transform(
-        #     'zed_camera_link',
-        #     msg.header.frame_id,
-        #     Time(),  # Ultimo TF disponibile
-        #     timeout=Duration(seconds=0.1)
-        # ):
-            # Non stampare warning ogni volta, solo ogni 100 volte
-            # self.tf_warning_count += 1
-            # if self.tf_warning_count % 100 == 0:
-            #     self.get_logger().warn(
-            #         f"TF non disponibile: {msg.header.frame_id} -> zed_camera_link "
-            #         f"(warning #{self.tf_warning_count})"
-            #     )
-            # return []
-        
-        #now = self.node.get_clock().now()
-        #msg_time = Time.from_msg(msg.header.stamp)
-        
-        # Verifica che il TF sia disponibile PRIMA di processare i punti
-        #try:
-        # Cerca la trasformazione con timeout più lungo
-        
-        transform = self.tf_buffer.lookup_transform(
-            'chassis_link',    # target frame
-            msg.header.frame_id,  # source
-            Time.from_msg(msg.header.stamp),
-            #msg.header.stamp,
-            timeout=rclpy.duration.Duration(seconds=0.5)
-        )
-        
-        # try:
-        #     transform = self.tf_buffer.lookup_transform(
-        #         'chassis_link',
-        #         msg.header.frame_id,
-        #         Time.from_msg(msg.header.stamp),
-        #         timeout=Duration(seconds=0.1)
-        #     )
-        # except ExtrapolationException:
-        #     transform = self.tf_buffer.lookup_transform(
-        #         'chassis_link',
-        #         msg.header.frame_id,
-        #         Time(),
-        #         timeout=Duration(seconds=0.1)
-        #     )
-
-        
-        
-    # except Exception as e:
-    #     self.tf_warning_count += 1
-    #     if self.tf_warning_count % 100 == 0:
-    #         self.get_logger().warn(f"TF lookup failed: {e} (warning #{self.tf_warning_count})")
-    #     return []
-    
-    # # Reset counter quando funziona
-    # if self.tf_warning_count > 0:
-    #     self.get_logger().info(f"TF ripristinato dopo {self.tf_warning_count} warning")
-    #     self.tf_warning_count = 0
-    
-    
-    # Ora processa i punti
-        for i in range(0, len(msg.data), msg.point_step):
-            
-            point_data = msg.data[i:i + msg.point_step]
-            x = struct.unpack('f', point_data[x_offset:x_offset+4])[0] 
-            y = struct.unpack('f', point_data[y_offset:y_offset+4])[0]  
-            z = struct.unpack('f', point_data[z_offset:z_offset+4])[0]
-            if not math.isfinite(x) or not math.isfinite(y) or not math.isfinite(z):
-                continue
-            if abs(y) > 0.1 or abs(z) > 0.1: # Filtra il rumore centrale
-                self.get_logger().info(f"RAW POINT - X: {x:.2f}, Y: {y:.2f}, Z: {z:.2f}", throttle_duration_sec=0.5)
-            #x,y = y,x
-
-            # Crea il punto nel frame della camera
-            p = PointStamped()
-            p.header.frame_id = msg.header.frame_id
-            p.header.stamp = msg.header.stamp
-            p.point.x = x
-            p.point.y = y
-            p.point.z = z
-
-            # Trasforma nel frame del robot (usa il transform già ottenuto)
-            try:
-                p_chassis = tf2_geometry_msgs.do_transform_point(p, transform)
-                
-                # if p_chassis.point.y < 0:
-                #     print(f"Rilevato punto a DESTRA: Y={p_chassis.point.y}")
-
-                #Filtra punti validi
-                if p_chassis.point.z < 0.1:
-                    continue
-                else:
-                    objects_detected.append([p_chassis.point.x, p_chassis.point.y, p_chassis.point.z])
-                #     abs(p_chassis.point.y) < 3.0 and
-                #     -0.5 < p_chassis.point.z < 2.5):
-                    
-                    # self.get_logger().info(
-                    #     f"Punto Trasformato -> X: {p_chassis.point.x:.2f}, Y: {p_chassis.point.y:.2f}",
-                    #     throttle_duration_sec=1.0 # Stampa ogni secondo per non intasare
-                    # )
-                    
-                    #print(f"Trasformato: camera[{x:.2f},{y:.2f},{z:.2f}] -> chassis[{x_robot:.2f},{y_robot:.2f},{z_robot:.2f}]")
-                
-                    
-            except Exception as e:
-                self.get_logger().error(f"Errore trasformazione punto: {e}")
-                continue  
-        
-        return objects_detected  
-            
 #L'OBIETTIVO E' FARE UN CLAUSTER AL FINE DI RICONOSCERE GLI OSTACOLI COSÌ DA FARE IL CONTROLLO RISPETTO AD UN 
 # OSTACOLO PIUTTOSTO CHE DA CIASCUN PUNTO
            
@@ -375,8 +212,10 @@ class DBSCANNode(Node):
             ]    
         )
 
-        self.eps = 0.5
-        self.min_points = 5
+        self.eps = 0.5        # Distanza minima tra due punti
+        self.min_points = 5   # Numero di punti minimo per definire un ostacolo
+        self.tf_buffer = Buffer(cache_time=Duration(seconds=10.0)) 
+        self.tf_listener = TransformListener(self.tf_buffer, self)
         self.cb_group = ReentrantCallbackGroup()
         self.pubGeometry = self.create_publisher(PointStamped, '/obstacles', 10)
         self.pubFlag = self.create_publisher(Bool, '/obstacle_detected',10)
@@ -393,37 +232,34 @@ class DBSCANNode(Node):
         if not valid_points_3d:
             return []        
             
-        # 2. Applica DBSCAN
+        # Applico DBSCAN
         dbscan_instance = dbscan(valid_points_3d, self.eps, self.min_points)
         
-        # Misura il tempo di esecuzione
+        # Misuro il tempo di esecuzione
         time_execution, _ = timedcall(dbscan_instance.process)
         
-        # 3. Estrai i cluster
+        # 3. Mi restiruisce una lista di cui ciascun elemento contiene una lista di indici che indicano il raggruppamento di punti
         cluster_points = dbscan_instance.get_clusters()
         
         print(f"DBSCAN trovato {len(cluster_points)} ostacoli in {time_execution:.3f}s")
         
-        # 4. Converti i cluster in ostacoli 3D
+        # 4. Converto i cluster in ostacoli 3D
         obstacles_3d = []
         valid_obstacle = []
                             
-        # Calcola il centroide dell'ostacolo
+        # Calcolo il centroide dell'ostacolo
         for indices in cluster_points:
             
             valid_cluster = [valid_points_3d[i] for i in indices]
             centroid = self.calculate_centroid(valid_cluster)
             obstacles_3d.append({
-                'centroid': centroid,  # [x, y, z] del centro
-                'points': valid_cluster,  # Tutti i punti del cluster
+                'centroid': centroid,  
+                'points': valid_cluster,  
                 'size': len(valid_cluster),
                 'distance': math.sqrt(centroid[0]**2 + centroid[1]**2)
             })
             
         for o in obstacles_3d:
-            # x, y, z = o['centroid']
-
-            # if 0 < x < 2.0 and abs(y) < 3.0 and z > 0:
             valid_obstacle.append(o['centroid'])
             
         return valid_obstacle
@@ -434,48 +270,56 @@ class DBSCANNode(Node):
             return None       
         sum_x = sum(p[0] for p in points)
         sum_y = sum(p[1] for p in points) 
-        #sum_z = sum(p[2] for p in points)
         n = len(points)
         return [sum_x/n, sum_y/n]
     
     def get_largest_obstacle(self, obstacles):
-        """Restituisce l'ostacolo più grande (più punti)"""
+
         if not obstacles:
             return None
         return max(obstacles, key=lambda x: x['size'])
     
     def get_closest_obstacle(self, obstacles):
-        """Restituisce l'ostacolo più vicino"""
+
         if not obstacles:
             return None
         return min(obstacles, key=lambda x: x['distance'])
 
     def dbscan_callback(self, msg):
         
+        # Prendo i punti della PointCloud filtrata e li sottocampiono per poi elaborarli
         points = [
             [float(p[0]), float(p[1])] 
             for p in point_cloud2.read_points(msg, field_names=("x", "y"), skip_nans=True)
         ]
-        downsampled_points = [list(p) for p in points[::3]] #sottocampionamento
-        # DEBUG: Conta quanti punti sono a destra (y < 0) e quanti a sinistra (y > 0)
-        destra = len([p for p in points if p[1] < 0])
-        sinistra = len([p for p in points if p[1] > 0])
-        self.get_logger().info(f"Punti ricevuti - Totali: {len(points)}, Sinistra: {sinistra}, Destra: {destra}")
+        downsampled_points = [list(p) for p in points[::3]]
+        
         if not points:
             return
+        
         obstacles = self.cluster_obstacles(downsampled_points)
-        
         detected = len(obstacles) > 0
-        
         self.pubFlag.publish(Bool(data=detected))
+        
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                'chassis_link',       # target frame
+                msg.header.frame_id,  # source frame
+                Time.from_msg(msg.header.stamp),
+                timeout=rclpy.duration.Duration(seconds=0.5)
+            )
+        except Exception as e:
+            self.get_logger().warn(f"TF non disponibile: {e}")
+            return
 
         for o in obstacles:
             p = PointStamped()
             p.header = msg.header
             p.point.x = o[0]
             p.point.y = o[1]
-            #p.point.z = o[2]
-            self.pubGeometry.publish(p)
+            # Presi gli ostacoli calcolati nel frame della zed faccio il cambio di coordinate rispetto al telaio del robot e li pubblico
+            p_chassis = tf2_geometry_msgs.do_transform_point(p, transform) 
+            self.pubGeometry.publish(p_chassis)
             
 class TeleopNode(Node):
 
@@ -491,13 +335,11 @@ class TeleopNode(Node):
         self.settings = termios.tcgetattr(sys.stdin) 
         self.cb_group = ReentrantCallbackGroup()
         self.pub = self.create_publisher(Twist, '/cmd_vel_teleop', 10)
-
         self.target_lin = 0.0
         self.target_ang = 0.0
         self.ctrl_lin = 0.0
         self.ctrl_ang = 0.0
-
-        self.timer = self.create_timer(0.05, self.teleop_callback, callback_group=self.cb_group)
+        self.timer = self.create_timer(0.01, self.teleop_callback, callback_group=self.cb_group)
 
     def destroy_node(self):
         if os.name != 'nt':
@@ -522,13 +364,9 @@ class TeleopNode(Node):
             print_vels(self.target_lin, self.target_ang)
         elif key == ' ' or key == 's':
             self.target_lin = self.target_ang = 0.0
-        # else:
-        #     if (key == '\x03'):
-        #         break
 
         self.ctrl_lin = make_simple_profile(self.ctrl_lin, self.target_lin, LIN_VEL_STEP_SIZE / 2)
         self.ctrl_ang = make_simple_profile(self.ctrl_ang, self.target_ang, ANG_VEL_STEP_SIZE / 2)
-        #print_vels(self.target_lin, self.target_ang)
         update_velocity(self.pub,ROS_DISTRO,self.ctrl_lin, self.ctrl_ang)
     
             
@@ -558,9 +396,8 @@ class APFNode(Node):
         
     def compute_attractive_forces(self, v_lin, angle):
         
-        #attractive_force = self.config['attractive_gain'] * (v_lin * np.sin (np.arctan2(y_dist, x_dist)))
         new_lin_vel = v_lin * np.cos (angle)
-        attractive_force = v_lin * np.sin(angle) * self.config['attractive_gain'] # angolo verde = atan di (y/x) e si semplifica con tan
+        attractive_force = v_lin * np.sin(angle) * self.config['attractive_gain']
         
         return [ new_lin_vel, attractive_force ]
     
@@ -598,9 +435,7 @@ class APFNode(Node):
         self.obstacle = [msg.point.x, msg.point.y, msg.point.z]
         [apf_lin_vel, apf_ang_vel, angle] = self.compute_total_force( self.teleop_lin_vel, self.obstacle)
         apf_lin_vel = apf_lin_vel * self.config['LIN_VELOCITY_GAIN']
-        apf_ang_vel = apf_ang_vel * self.config['ANG_VELOCITY_GAIN']
-        #self.ctrl_lin = make_simple_profile(apf_lin_vel, self.teleop_lin_vel, LIN_VEL_STEP_SIZE / 2)
-        #self.ctrl_ang = make_simple_profile(apf_ang_vel, self.teleop_ang_vel, ANG_VEL_STEP_SIZE / 2)
+        apf_ang_vel =  -apf_ang_vel * self.config['ANG_VELOCITY_GAIN']
         update_velocity(self.pub,ROS_DISTRO,apf_lin_vel, apf_ang_vel)
         
 class VelocityMuxNode(Node):
@@ -614,12 +449,8 @@ class VelocityMuxNode(Node):
         self.AngularApf = 0.0
         self.obstacleDetected = False
         self.last_obstacle_time = self.get_clock().now()
-        self.obstacle_timeout = 0.5 
         self.cb_group = ReentrantCallbackGroup()
         self.pub = self.create_publisher(Twist, '/cmd_vel', 10)
-        # self.create_subscription(
-        #     PointStamped, '/obstacles', self.mux_callback, 10, callback_group=self.cb_group
-        # )
         self.create_subscription(
             Twist, '/cmd_vel_teleop', self.mux_teleop_callback, 10, callback_group=self.cb_group
         )
@@ -641,28 +472,23 @@ class VelocityMuxNode(Node):
 
         now = self.get_clock().now()
         time_diff = (now - self.last_obstacle_time).nanoseconds / 1e9
-        
         twist = Twist()
         
         if self.obstacleDetected and time_diff < 0.5:
             twist.linear.x = self.LinearApf
             twist.angular.z = self.AngularApf
+            print_vels(self.LinearApf, self.AngularApf)
         else:
             twist.linear.x = self.LinearTeleop
             twist.angular.z = self.AngularTeleop
 
-            
         self.pub.publish(twist)
-        
-    # def mux_callback (self,msg):
-            
-    #     self.last_obstacle_time = self.get_clock().now()
             
     def mux_teleop_callback (self,msg):
         
         self.LinearTeleop = msg.linear.x
         self.AngularTeleop = msg.angular.z
-            
+        
     def mux_apf_callback (self,msg):
         
         self.LinearApf = msg.linear.x
@@ -671,9 +497,7 @@ class VelocityMuxNode(Node):
 def main(args=None):
     
     rclpy.init(args=args)
-
     executor = MultiThreadedExecutor(num_threads=5)
-    
     p_node = PerceptionNode ()
     p_node.tf_buffer = Buffer()
     p_node.tf_listener = TransformListener(p_node.tf_buffer, p_node)
@@ -700,8 +524,7 @@ def main(args=None):
         for n in nodes:
             executor.remove_node(n)
             n.destroy_node()
-        #rclpy.shutdown()
-        #executor.shutdown()
+            
         if rclpy.ok():
             rclpy.shutdown()
 

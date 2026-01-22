@@ -1,7 +1,6 @@
 digraph G {
-"map" -> "odom"[label=" Broadcaster: default_authority\nAverage rate: 61.304\nBuffer length: 0.767\nMost recent transform: 18.050001\nOldest transform: 17.283334\n"];
 "World" -> "map"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
-"odom" -> "chassis_link"[label=" Broadcaster: default_authority\nAverage rate: 61.304\nBuffer length: 0.767\nMost recent transform: 18.050001\nOldest transform: 17.283334\n"];
+"odom" -> "chassis_link"[label=" Broadcaster: default_authority\nAverage rate: 61.429\nBuffer length: 0.7\nMost recent transform: 503.58336\nOldest transform: 502.88336\n"];
 "chassis_link" -> "caster_frame_base"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
 "chassis_link" -> "wheel_left"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
 "chassis_link" -> "wheel_right"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
@@ -15,8 +14,9 @@ digraph G {
 "zed_left_camera_frame" -> "zed_left_camera_optical_frame"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
 "zed_camera_center" -> "zed_right_camera_frame"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
 "zed_right_camera_frame" -> "zed_right_camera_optical_frame"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"map" -> "odom"[label=" Broadcaster: default_authority\nAverage rate: 61.429\nBuffer length: 0.7\nMost recent transform: 503.58336\nOldest transform: 502.88336\n"];
 edge [style=invis];
  subgraph cluster_legend { style=bold; color=black; label ="view_frames Result";
-"Recorded at time: 1768918065.004513"[ shape=plaintext ] ;
+"Recorded at time: 1768995155.5570211"[ shape=plaintext ] ;
 }->"World";
 }
