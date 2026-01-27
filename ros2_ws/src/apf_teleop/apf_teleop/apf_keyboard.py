@@ -6,7 +6,11 @@ import struct
 import numpy as np
 import rclpy
 import tf2_geometry_msgs 
+#import matplotlib.pyplot as plt
 #import matplotlib
+#matplotlib.use('Agg')
+
+import csv
 
 if os.name == 'nt':
     import msvcrt
@@ -71,8 +75,40 @@ APF_CONFIG = {
     'repulsive_gain': 0.1,      # Guadagno forza repulsiva
     'attractive_gain': 5.0,     # Guadagno forza attrattiva  
     'LIN_VELOCITY_GAIN': 1.0,   # Guadagno velocità lineare 
-    'ANG_VELOCITY_GAIN': 0.1,   # Guadagno velocità angolare
+    'ANG_VELOCITY_GAIN': 1,   # Guadagno velocità angolare
 }
+
+#import matplotlib.pyplot as plt
+
+# def plot_apf_results(apf_node_instance):
+#     # Verifichiamo se ci sono dati nelle liste del nodo
+#     if not apf_node_instance.history_lin:
+#         print("Nessun dato raccolto per il plot.")
+#         return
+
+#     plt.figure(figsize=(12, 5))
+
+#     # Grafico 1: Velocità
+#     plt.subplot(1, 2, 1)
+#     plt.plot(apf_node_instance.history_lin, label='Lineare (x)', color='blue')
+#     plt.plot(apf_node_instance.history_ang, label='Angolare (z)', color='red')
+#     plt.title('Velocità Comandate')
+#     plt.xlabel('Campioni')
+#     plt.ylabel('m/s o rad/s')
+#     plt.legend()
+#     plt.grid(True)
+
+#     # Grafico 2: Istogramma Forze Repulsive
+#     plt.subplot(1, 2, 2)
+#     plt.hist(apf_node_instance.history_rep, bins=30, color='green', edgecolor='black')
+#     plt.title('Distribuzione Forza Repulsiva')
+#     plt.xlabel('Intensità Forza')
+#     plt.ylabel('Frequenza')
+
+#     plt.tight_layout()
+#     plt.savefig('risultati_simulazione.png')
+#     print("Grafici salvati correttamente in 'risultati_simulazione.png'")
+#     # Non usare plt.show() in Docker, savefig è sufficiente
 
 def get_key(settings):
     
@@ -303,9 +339,10 @@ class DBSCANNode(Node):
         
         try:
             transform = self.tf_buffer.lookup_transform(
-                'chassis_link',       # target frame
+                'base_link',       # target frame
                 msg.header.frame_id,  # source frame
-                Time.from_msg(msg.header.stamp),
+                rclpy.time.Time(seconds=0),
+                #Time.from_msg(msg.header.stamp),
                 timeout=rclpy.duration.Duration(seconds=0.5)
             )
         except Exception as e:
@@ -315,6 +352,7 @@ class DBSCANNode(Node):
         for o in obstacles:
             p = PointStamped()
             p.header = msg.header
+            p.header.stamp = self.get_clock().now().to_msg()
             p.point.x = o[0]
             p.point.y = o[1]
             # Presi gli ostacoli calcolati nel frame della zed faccio il cambio di coordinate rispetto al telaio del robot e li pubblico
@@ -385,6 +423,7 @@ class APFNode(Node):
         self.ctrl_lin = 0.0
         self.ctrl_ang = 0.0
         self.obstacle = []
+        self.history_rep = []
         self.cb_group = ReentrantCallbackGroup()
         self.pub = self.create_publisher(Twist, '/cmd_vel_apf', 10)
         self.create_subscription(
@@ -417,10 +456,12 @@ class APFNode(Node):
             self.get_logger().error("Dati ostacolo incompleti (possibile buffer overflow in Sim)")
             return [0.0, 0.0, 0.0]
         
-        angle = np.atan2 (distance[1] , distance[0])
+        angle = np.arctan2 (distance[1] , distance[0])
         print(f"[OSTACOLO] x={distance[0]:.2f}, y={distance[1]:.2f}, z={distance[2]:.2f}, angle={np.degrees(angle):.1f}°")
         [ new_lin_vel, attractive_force ] = self.compute_attractive_forces (control_linear_velocity, angle)
         repulsive_force = self.compute_repulsive_forces(distance[0], angle )
+        self.history_rep.append(repulsive_force)
+
         total_force = attractive_force - repulsive_force
          
         return [ new_lin_vel, total_force, angle ]
@@ -431,12 +472,14 @@ class APFNode(Node):
         self.teleop_ang_vel = msg.angular.z
     
     def apf_callback(self,msg):
-            
+        
         self.obstacle = [msg.point.x, msg.point.y, msg.point.z]
         [apf_lin_vel, apf_ang_vel, angle] = self.compute_total_force( self.teleop_lin_vel, self.obstacle)
         apf_lin_vel = apf_lin_vel * self.config['LIN_VELOCITY_GAIN']
-        apf_ang_vel =  -apf_ang_vel * self.config['ANG_VELOCITY_GAIN']
+        apf_ang_vel = -np.sign(angle)*apf_ang_vel * self.config['ANG_VELOCITY_GAIN']
+        #np.sign(msg.point.y)*
         update_velocity(self.pub,ROS_DISTRO,apf_lin_vel, apf_ang_vel)
+
         
 class VelocityMuxNode(Node):
     
@@ -448,6 +491,8 @@ class VelocityMuxNode(Node):
         self.LinearApf = 0.0
         self.AngularApf = 0.0
         self.obstacleDetected = False
+        self.history_lin = []
+        self.history_ang = []
         self.last_obstacle_time = self.get_clock().now()
         self.cb_group = ReentrantCallbackGroup()
         self.pub = self.create_publisher(Twist, '/cmd_vel', 10)
@@ -481,7 +526,9 @@ class VelocityMuxNode(Node):
         else:
             twist.linear.x = self.LinearTeleop
             twist.angular.z = self.AngularTeleop
-
+        
+        self.history_lin.append(twist.linear.x)
+        self.history_ang.append(twist.angular.z)
         self.pub.publish(twist)
             
     def mux_teleop_callback (self,msg):
@@ -501,13 +548,15 @@ def main(args=None):
     p_node = PerceptionNode ()
     p_node.tf_buffer = Buffer()
     p_node.tf_listener = TransformListener(p_node.tf_buffer, p_node)
+    mux_node = VelocityMuxNode()
+    apf_node = APFNode()
 
     nodes = [
         p_node,
         DBSCANNode(),
         TeleopNode(),
-        APFNode(),
-        VelocityMuxNode()
+        apf_node,
+        mux_node
     ]
 
     for n in nodes:
@@ -520,6 +569,27 @@ def main(args=None):
         pass
     
     finally:
+        #plot_apf_results(mux_node)
+        try:
+            filename = 'dati_simulazione.csv'
+            with open(filename, mode='w', newline='') as f:
+                writer = csv.writer(f)
+                # Scriviamo le intestazioni
+                writer.writerow(['step', 'linear_x', 'angular_z', 'repulsive_force'])
+                
+                # Troviamo la lunghezza minima per evitare errori di indice
+                min_len = min(len(mux_node.history_lin), len(apf_node.history_rep))
+                
+                for i in range(min_len):
+                    writer.writerow([
+                        i, 
+                        mux_node.history_lin[i], 
+                        mux_node.history_ang[i], 
+                        apf_node.history_rep[i]
+                    ])
+            print(f"Salvataggio completato: {filename}")
+        except Exception as e:
+            print(f"Errore durante il salvataggio CSV: {e}")
         executor.shutdown()
         for n in nodes:
             executor.remove_node(n)
