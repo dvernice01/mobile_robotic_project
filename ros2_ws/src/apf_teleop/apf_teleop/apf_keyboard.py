@@ -75,40 +75,9 @@ APF_CONFIG = {
     'repulsive_gain': 0.1,      # Guadagno forza repulsiva
     'attractive_gain': 5.0,     # Guadagno forza attrattiva  
     'LIN_VELOCITY_GAIN': 1.0,   # Guadagno velocità lineare 
-    'ANG_VELOCITY_GAIN': 1,   # Guadagno velocità angolare
+    'ANG_VELOCITY_GAIN': 2.5,   # Guadagno velocità angolare
 }
 
-#import matplotlib.pyplot as plt
-
-# def plot_apf_results(apf_node_instance):
-#     # Verifichiamo se ci sono dati nelle liste del nodo
-#     if not apf_node_instance.history_lin:
-#         print("Nessun dato raccolto per il plot.")
-#         return
-
-#     plt.figure(figsize=(12, 5))
-
-#     # Grafico 1: Velocità
-#     plt.subplot(1, 2, 1)
-#     plt.plot(apf_node_instance.history_lin, label='Lineare (x)', color='blue')
-#     plt.plot(apf_node_instance.history_ang, label='Angolare (z)', color='red')
-#     plt.title('Velocità Comandate')
-#     plt.xlabel('Campioni')
-#     plt.ylabel('m/s o rad/s')
-#     plt.legend()
-#     plt.grid(True)
-
-#     # Grafico 2: Istogramma Forze Repulsive
-#     plt.subplot(1, 2, 2)
-#     plt.hist(apf_node_instance.history_rep, bins=30, color='green', edgecolor='black')
-#     plt.title('Distribuzione Forza Repulsiva')
-#     plt.xlabel('Intensità Forza')
-#     plt.ylabel('Frequenza')
-
-#     plt.tight_layout()
-#     plt.savefig('risultati_simulazione.png')
-#     print("Grafici salvati correttamente in 'risultati_simulazione.png'")
-#     # Non usare plt.show() in Docker, savefig è sufficiente
 
 def get_key(settings):
     
@@ -423,7 +392,7 @@ class APFNode(Node):
         self.ctrl_lin = 0.0
         self.ctrl_ang = 0.0
         self.obstacle = []
-        self.history_rep = []
+        self.history_total_force = []
         self.cb_group = ReentrantCallbackGroup()
         self.pub = self.create_publisher(Twist, '/cmd_vel_apf', 10)
         self.create_subscription(
@@ -436,7 +405,7 @@ class APFNode(Node):
     def compute_attractive_forces(self, v_lin, angle):
         
         new_lin_vel = v_lin * np.cos (angle)
-        attractive_force = v_lin * np.sin(angle) * self.config['attractive_gain']
+        attractive_force = np.abs(v_lin * np.sin(angle) * self.config['attractive_gain'])
         
         return [ new_lin_vel, attractive_force ]
     
@@ -460,10 +429,10 @@ class APFNode(Node):
         print(f"[OSTACOLO] x={distance[0]:.2f}, y={distance[1]:.2f}, z={distance[2]:.2f}, angle={np.degrees(angle):.1f}°")
         [ new_lin_vel, attractive_force ] = self.compute_attractive_forces (control_linear_velocity, angle)
         repulsive_force = self.compute_repulsive_forces(distance[0], angle )
-        self.history_rep.append(repulsive_force)
 
         total_force = attractive_force - repulsive_force
-         
+        self.history_total_force.append(float(total_force))
+
         return [ new_lin_vel, total_force, angle ]
     
     def apfTeleop_callback(self, msg):
@@ -491,8 +460,9 @@ class VelocityMuxNode(Node):
         self.LinearApf = 0.0
         self.AngularApf = 0.0
         self.obstacleDetected = False
-        self.history_lin = []
-        self.history_ang = []
+        self.history_lin = [0.0]
+        self.history_ang = [0.0]
+        #self.history_rep = []
         self.last_obstacle_time = self.get_clock().now()
         self.cb_group = ReentrantCallbackGroup()
         self.pub = self.create_publisher(Twist, '/cmd_vel', 10)
@@ -518,6 +488,7 @@ class VelocityMuxNode(Node):
         now = self.get_clock().now()
         time_diff = (now - self.last_obstacle_time).nanoseconds / 1e9
         twist = Twist()
+        twist_published =  Twist()
         
         if self.obstacleDetected and time_diff < 0.5:
             twist.linear.x = self.LinearApf
@@ -526,10 +497,14 @@ class VelocityMuxNode(Node):
         else:
             twist.linear.x = self.LinearTeleop
             twist.angular.z = self.AngularTeleop
-        
-        self.history_lin.append(twist.linear.x)
-        self.history_ang.append(twist.angular.z)
-        self.pub.publish(twist)
+
+        twist_published.linear.x = make_simple_profile(self.history_lin[-1], twist.linear.x, LIN_VEL_STEP_SIZE)
+        twist_published.angular.z = make_simple_profile(self.history_ang[-1], twist.angular.z, ANG_VEL_STEP_SIZE)
+        #update_velocity(self.pub,ROS_DISTRO,self.ctrl_lin, self.ctrl_ang)
+        self.history_lin.append(float(twist_published.linear.x))
+        self.history_ang.append(float(twist_published.angular.z))
+        #self.history_rep.append(APFNode().history_rep)
+        self.pub.publish(twist_published)
             
     def mux_teleop_callback (self,msg):
         
@@ -566,30 +541,40 @@ def main(args=None):
         executor.spin()
         
     except KeyboardInterrupt:
-        pass
+        
     
-    finally:
+    #finally:
         #plot_apf_results(mux_node)
+        
+        # --- SALVATAGGIO VELOCITÀ (dal Mux) ---
         try:
-            filename = 'dati_simulazione.csv'
-            with open(filename, mode='w', newline='') as f:
+            file_vel = 'velocita_simulazione.csv'
+            h_lin = mux_node.history_lin
+            h_ang = mux_node.history_ang
+            
+            with open(file_vel, mode='w', newline='') as f:
                 writer = csv.writer(f)
-                # Scriviamo le intestazioni
-                writer.writerow(['step', 'linear_x', 'angular_z', 'repulsive_force'])
-                
-                # Troviamo la lunghezza minima per evitare errori di indice
-                min_len = min(len(mux_node.history_lin), len(apf_node.history_rep))
-                
-                for i in range(min_len):
-                    writer.writerow([
-                        i, 
-                        mux_node.history_lin[i], 
-                        mux_node.history_ang[i], 
-                        apf_node.history_rep[i]
-                    ])
-            print(f"Salvataggio completato: {filename}")
+                writer.writerow(['step', 'linear_x', 'angular_z'])
+                for i in range(len(h_lin)):
+                    writer.writerow([i, float(h_lin[i]), float(h_ang[i])])
+            print(f"File velocità salvato: {file_vel} ({len(h_lin)} campioni)")
+            print(f"Ultimo valore angolare: {h_ang[-1]}") # Per tua verifica
         except Exception as e:
-            print(f"Errore durante il salvataggio CSV: {e}")
+            print(f"Errore salvataggio velocità: {e}")
+
+        # --- SALVATAGGIO FORZE (dall'APF) ---
+        try:
+            file_force = 'forza_simulazione.csv'
+            h_force = apf_node.history_total_force
+            
+            with open(file_force, mode='w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['step', 'total_force'])
+                for i in range(len(h_force)):
+                    writer.writerow([i, float(h_force[i])])
+            print(f"File forza salvato: {file_force} ({len(h_force)} campioni)")
+        except Exception as e:
+            print(f"Errore salvataggio forza: {e}")
         executor.shutdown()
         for n in nodes:
             executor.remove_node(n)
