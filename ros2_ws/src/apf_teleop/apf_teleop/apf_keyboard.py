@@ -72,10 +72,10 @@ Communications Failed
 
 # vettore dei guadagni 
 APF_CONFIG = {
-    'repulsive_gain': 0.1,      # Guadagno forza repulsiva
-    'attractive_gain': 5.0,     # Guadagno forza attrattiva  
-    'LIN_VELOCITY_GAIN': 1.0,   # Guadagno velocità lineare 
-    'ANG_VELOCITY_GAIN': 2.5,   # Guadagno velocità angolare
+    'repulsive_gain': 8.0,      # Guadagno forza repulsiva
+    'attractive_gain': 2.0,     # Guadagno forza attrattiva  
+    'LIN_VELOCITY_GAIN': 5.0,   # Guadagno velocità lineare 
+    'ANG_VELOCITY_GAIN': 3.0,   # Guadagno velocità angolare
 }
 
 
@@ -387,36 +387,39 @@ class APFNode(Node):
             ]
         )
         self.config = APF_CONFIG
-        self.teleop_lin_vel = 0.0
-        self.teleop_ang_vel = 0.0
+        self.lin_vel = 0.0
+        self.ang_vel = 0.0
         self.ctrl_lin = 0.0
         self.ctrl_ang = 0.0
         self.obstacle = []
-        self.history_total_force = []
+        self.history_total_force_x = []
+        self.history_total_force_y = []
         self.cb_group = ReentrantCallbackGroup()
         self.pub = self.create_publisher(Twist, '/cmd_vel_apf', 10)
         self.create_subscription(
             PointStamped, '/obstacles', self.apf_callback, 10, callback_group=self.cb_group
         )
         self.create_subscription(
-            Twist, '/cmd_vel_teleop', self.apfTeleop_callback, 10, callback_group=self.cb_group
+            Twist, '/cmd_vel', self.apfVel_callback, 10, callback_group=self.cb_group
         )
         
-    def compute_attractive_forces(self, v_lin, angle):
+    def compute_attractive_forces(self, v_lin):
+        # ci sono 2 forze attratie quella diretta lungo x e quella lungo y, il robot si muove solo lungo x
+        # quindi avremo una forza attrattiva lungo x proporzionale a v_lin e una lungo y sempre nulla
+        # questo perchè stimo proiettanfdo le forze sugli assi del robot
+        attractive_force = np.abs(v_lin * self.config['attractive_gain'])
         
-        new_lin_vel = v_lin * np.cos (angle)
-        attractive_force = np.abs(v_lin * np.sin(angle) * self.config['attractive_gain'])
-        
-        return [ new_lin_vel, attractive_force ]
+        return attractive_force 
     
-    def compute_repulsive_forces(self, x_dist, angle):
+    def compute_repulsive_forces(self, x_dist, y_dist):
 
-        gamma = 1
-        eta_0 = 1
-        eta_i = x_dist * np.sin(angle)
-        eta_i = np.sign(eta_i) * max(abs(eta_i), 0.1)
-        repulsive_force = (self.config['repulsive_gain']/eta_i**2) * ((1/eta_i - 1/eta_0)**(gamma - 1))
-        
+        gamma = 4
+        eta_0 = 20
+        eta_i = max(abs( np.sqrt(x_dist**2 + y_dist**2) ), 0.1)
+        #dist_min = abs(eta_0 - eta_i)
+        repulsive_force_x = (self.config['repulsive_gain']/eta_i**2) * ((1/eta_i - 1/eta_0)**(gamma - 1))
+        repulsive_force_y = y_dist #il meno va usato per far girare il robot dalla parte esatta cioè in direzione opposta all'ostacolo
+        repulsive_force = [repulsive_force_x, repulsive_force_y]
         return repulsive_force
 
     def compute_total_force(self, control_linear_velocity, distance):
@@ -425,27 +428,31 @@ class APFNode(Node):
             self.get_logger().error("Dati ostacolo incompleti (possibile buffer overflow in Sim)")
             return [0.0, 0.0, 0.0]
         
-        angle = np.arctan2 (distance[1] , distance[0])
-        print(f"[OSTACOLO] x={distance[0]:.2f}, y={distance[1]:.2f}, z={distance[2]:.2f}, angle={np.degrees(angle):.1f}°")
-        [ new_lin_vel, attractive_force ] = self.compute_attractive_forces (control_linear_velocity, angle)
-        repulsive_force = self.compute_repulsive_forces(distance[0], angle )
+        #angle = np.arctan2 (distance[1] , distance[0])
+        print(f"[OSTACOLO] x={distance[0]:.2f}, y={distance[1]:.2f}, z={distance[2]:.2f}°")
+        attractive_force = self.compute_attractive_forces (control_linear_velocity)
+        repulsive_force = self.compute_repulsive_forces(distance[0], distance[1] )
+        total_force_x =  float(attractive_force) - float(repulsive_force[0])
+        total_force_y = 0.0 - repulsive_force[1] # 0 è la forza attrattiva lungo y
+        self.history_total_force_x.append(float(total_force_x))
+        self.history_total_force_y.append(float(total_force_y))
 
-        total_force = attractive_force - repulsive_force
-        self.history_total_force.append(float(total_force))
-
-        return [ new_lin_vel, total_force, angle ]
+        return [ total_force_x, total_force_y ]
     
-    def apfTeleop_callback(self, msg):
+    def apfVel_callback(self, msg):
         
-        self.teleop_lin_vel = msg.linear.x 
-        self.teleop_ang_vel = msg.angular.z
+        self.lin_vel = msg.linear.x 
+        self.ang_vel = msg.angular.z
     
     def apf_callback(self,msg):
         
         self.obstacle = [msg.point.x, msg.point.y, msg.point.z]
-        [apf_lin_vel, apf_ang_vel, angle] = self.compute_total_force( self.teleop_lin_vel, self.obstacle)
-        apf_lin_vel = apf_lin_vel * self.config['LIN_VELOCITY_GAIN']
-        apf_ang_vel = -np.sign(angle)*apf_ang_vel * self.config['ANG_VELOCITY_GAIN']
+        [total_force_x, total_force_y] = self.compute_total_force( self.lin_vel, self.obstacle)
+        if total_force_x < 0.0:
+            apf_lin_vel = self.lin_vel + (total_force_x * self.config['LIN_VELOCITY_GAIN'])
+        else:
+            apf_lin_vel = self.lin_vel
+        apf_ang_vel = (total_force_y* self.config['ANG_VELOCITY_GAIN'])
         #np.sign(msg.point.y)*
         update_velocity(self.pub,ROS_DISTRO,apf_lin_vel, apf_ang_vel)
 
@@ -565,14 +572,15 @@ def main(args=None):
         # --- SALVATAGGIO FORZE (dall'APF) ---
         try:
             file_force = 'forza_simulazione.csv'
-            h_force = apf_node.history_total_force
-            
+            h_force_x = apf_node.history_total_force_x
+            h_force_y = apf_node.history_total_force_y
+   
             with open(file_force, mode='w', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(['step', 'total_force'])
-                for i in range(len(h_force)):
-                    writer.writerow([i, float(h_force[i])])
-            print(f"File forza salvato: {file_force} ({len(h_force)} campioni)")
+                writer.writerow(['step', 'total_force', 'total_force_y'])
+                for i in range(len(h_force_x)):
+                    writer.writerow([i, float(h_force_x[i]), float(h_force_y[i])])
+            print(f"File forza salvato: {file_force} ({len(h_force_x)} campioni)")
         except Exception as e:
             print(f"Errore salvataggio forza: {e}")
         executor.shutdown()
