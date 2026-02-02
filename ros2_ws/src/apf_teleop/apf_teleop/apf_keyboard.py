@@ -419,7 +419,7 @@ class APFNode(Node):
         #eta_i = max(abs( np.sqrt(x_dist**2 + y_dist**2) ), 0.1)
         #dist_min = abs(eta_0 - eta_i)
         repulsive_force_x = (self.config['repulsive_gain']/eta_i**2) * ((1/eta_i - 1/eta_0)**(gamma - 1))
-        repulsive_force_y = y_dist #il meno va usato per far girare il robot dalla parte esatta cioè in direzione opposta all'ostacolo
+        repulsive_force_y = y_dist
         repulsive_force = [repulsive_force_x, repulsive_force_y]
         return repulsive_force
 
@@ -533,11 +533,13 @@ def main(args=None):
     p_node.tf_listener = TransformListener(p_node.tf_buffer, p_node)
     mux_node = VelocityMuxNode()
     apf_node = APFNode()
+    teleop_node = TeleopNode()
+    dbscan_node = DBSCANNode()
 
     nodes = [
         p_node,
-        DBSCANNode(),
-        TeleopNode(),
+        dbscan_node,
+        teleop_node,
         apf_node,
         mux_node
     ]
@@ -550,11 +552,7 @@ def main(args=None):
         
     except KeyboardInterrupt:
         
-    
-    #finally:
-        #plot_apf_results(mux_node)
-        
-        # --- SALVATAGGIO VELOCITÀ (dal Mux) ---
+        # SALVATAGGIO VELOCITÀ 
         try:
             file_vel = 'velocita_simulazione.csv'
             h_lin = mux_node.history_lin
@@ -570,7 +568,7 @@ def main(args=None):
         except Exception as e:
             print(f"Errore salvataggio velocità: {e}")
 
-        # --- SALVATAGGIO FORZE (dall'APF) ---
+        # SALVATAGGIO FORZE 
         try:
             file_force = 'forza_simulazione.csv'
             h_force_x = apf_node.history_total_force_x
@@ -587,7 +585,7 @@ def main(args=None):
         executor.shutdown()
         for n in nodes:
             executor.remove_node(n)
-            n.destroy_node()
+            teleop_node.destroy_node()
             
         if rclpy.ok():
             rclpy.shutdown()
