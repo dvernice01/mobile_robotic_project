@@ -72,10 +72,10 @@ Communications Failed
 
 # vettore dei guadagni 
 APF_CONFIG = {
-    'repulsive_gain': 8.0,      # Guadagno forza repulsiva
-    'attractive_gain': 2.0,     # Guadagno forza attrattiva  
-    'LIN_VELOCITY_GAIN': 5.0,   # Guadagno velocità lineare 
-    'ANG_VELOCITY_GAIN': 3.0,   # Guadagno velocità angolare
+    'repulsive_gain': 10.0,      # Guadagno forza repulsiva
+    'attractive_gain': 0.5,     # Guadagno forza attrattiva  
+    'LIN_VELOCITY_GAIN': 10.0,   # Guadagno velocità lineare 
+    'ANG_VELOCITY_GAIN': 0.5,   # Guadagno velocità angolare
 }
 
 
@@ -415,7 +415,8 @@ class APFNode(Node):
 
         gamma = 4
         eta_0 = 20
-        eta_i = max(abs( np.sqrt(x_dist**2 + y_dist**2) ), 0.1)
+        eta_i = max(abs(x_dist), 0.1)
+        #eta_i = max(abs( np.sqrt(x_dist**2 + y_dist**2) ), 0.1)
         #dist_min = abs(eta_0 - eta_i)
         repulsive_force_x = (self.config['repulsive_gain']/eta_i**2) * ((1/eta_i - 1/eta_0)**(gamma - 1))
         repulsive_force_y = y_dist #il meno va usato per far girare il robot dalla parte esatta cioè in direzione opposta all'ostacolo
