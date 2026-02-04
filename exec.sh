@@ -1,1 +1,1 @@
-docker exec -it mobile_robotics_project bash
+docker exec -it zed_ros2_project bash
