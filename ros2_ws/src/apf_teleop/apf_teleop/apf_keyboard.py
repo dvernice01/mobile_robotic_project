@@ -45,7 +45,7 @@ WAFFLE_MAX_LIN_VEL = 2.26
 WAFFLE_MAX_ANG_VEL = 1.82
 
 LIN_VEL_STEP_SIZE = 0.01
-ANG_VEL_STEP_SIZE = 0.01
+ANG_VEL_STEP_SIZE = 0.1
 
 TURTLEBOT3_MODEL = os.environ.get('TURTLEBOT3_MODEL', 'waffle')
 ROS_DISTRO = os.environ.get('ROS_DISTRO')
@@ -72,10 +72,10 @@ Communications Failed
 
 # vettore dei guadagni 
 APF_CONFIG = {
-    'repulsive_gain': 10.0,      # Guadagno forza repulsiva
-    'attractive_gain': 0.5,     # Guadagno forza attrattiva  
-    'LIN_VELOCITY_GAIN': 10.0,   # Guadagno velocità lineare 
-    'ANG_VELOCITY_GAIN': 0.5,   # Guadagno velocità angolare
+    'repulsive_gain': 20.0,      # Guadagno forza repulsiva
+    'attractive_gain': 0.05,     # Guadagno forza attrattiva  
+    'LIN_VELOCITY_GAIN': 50.0,   # Guadagno velocità lineare 
+    'ANG_VELOCITY_GAIN': 0.3,   # Guadagno velocità angolare
 }
 
 
@@ -344,8 +344,8 @@ class TeleopNode(Node):
         self.pub = self.create_publisher(Twist, '/cmd_vel_teleop', 10)
         self.target_lin = 0.0
         self.target_ang = 0.0
-        self.ctrl_lin = 0.0
-        self.ctrl_ang = 0.0
+        #self.ctrl_lin = 0.0
+        #self.ctrl_ang = 0.0
         self.timer = self.create_timer(0.01, self.teleop_callback, callback_group=self.cb_group)
 
     def destroy_node(self):
@@ -372,9 +372,9 @@ class TeleopNode(Node):
         elif key == ' ' or key == 's':
             self.target_lin = self.target_ang = 0.0
 
-        self.ctrl_lin = make_simple_profile(self.ctrl_lin, self.target_lin, LIN_VEL_STEP_SIZE / 2)
-        self.ctrl_ang = make_simple_profile(self.ctrl_ang, self.target_ang, ANG_VEL_STEP_SIZE / 2)
-        update_velocity(self.pub,ROS_DISTRO,self.ctrl_lin, self.ctrl_ang)
+        #self.ctrl_lin = make_simple_profile(self.ctrl_lin, self.target_lin, LIN_VEL_STEP_SIZE / 2)
+        #self.ctrl_ang = make_simple_profile(self.ctrl_ang, self.target_ang, ANG_VEL_STEP_SIZE / 2)
+        update_velocity(self.pub,ROS_DISTRO,self.target_lin, self.target_ang)
     
             
 class APFNode(Node):
@@ -392,8 +392,10 @@ class APFNode(Node):
         self.ctrl_lin = 0.0
         self.ctrl_ang = 0.0
         self.obstacle = []
-        self.history_total_force_x = []
-        self.history_total_force_y = []
+        self.history_total_force_x = [0.0]
+        self.history_total_force_y = [0.0]
+        self.slop_y = 0.3
+        self.slop_x = 0.3
         self.cb_group = ReentrantCallbackGroup()
         self.pub = self.create_publisher(Twist, '/cmd_vel_apf', 10)
         self.create_subscription(
@@ -413,7 +415,7 @@ class APFNode(Node):
     
     def compute_repulsive_forces(self, x_dist, y_dist):
 
-        gamma = 4
+        gamma = 2
         eta_0 = 20
         eta_i = max(abs(x_dist), 0.1)
         #eta_i = max(abs( np.sqrt(x_dist**2 + y_dist**2) ), 0.1)
@@ -433,8 +435,10 @@ class APFNode(Node):
         print(f"[OSTACOLO] x={distance[0]:.2f}, y={distance[1]:.2f}, z={distance[2]:.2f}°")
         attractive_force = self.compute_attractive_forces (control_linear_velocity)
         repulsive_force = self.compute_repulsive_forces(distance[0], distance[1] )
-        total_force_x =  float(attractive_force) - float(repulsive_force[0])
-        total_force_y = 0.0 - repulsive_force[1] # 0 è la forza attrattiva lungo y
+        total_force_x_raw =  float(attractive_force) - float(repulsive_force[0])
+        total_force_y_raw = 0.0 - repulsive_force[1] # 0 è la forza attrattiva lungo y
+        total_force_x = make_simple_profile(self.history_total_force_x[-1], total_force_x_raw, self.slop_x)
+        total_force_y = make_simple_profile(self.history_total_force_y[-1], total_force_y_raw, self.slop_y)
         self.history_total_force_x.append(float(total_force_x))
         self.history_total_force_y.append(float(total_force_y))
 
@@ -505,9 +509,10 @@ class VelocityMuxNode(Node):
         else:
             twist.linear.x = self.LinearTeleop
             twist.angular.z = self.AngularTeleop
-
+        
         twist_published.linear.x = make_simple_profile(self.history_lin[-1], twist.linear.x, LIN_VEL_STEP_SIZE)
         twist_published.angular.z = make_simple_profile(self.history_ang[-1], twist.angular.z, ANG_VEL_STEP_SIZE)
+        
         #update_velocity(self.pub,ROS_DISTRO,self.ctrl_lin, self.ctrl_ang)
         self.history_lin.append(float(twist_published.linear.x))
         self.history_ang.append(float(twist_published.angular.z))
